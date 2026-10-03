@@ -1,5 +1,7 @@
 # VN Mod Stream GPU
 
+[🇻🇳 Tiếng Việt](#tieng-viet)
+
 ![VN Mod Stream GPU — llama.cpp GPU Weight Streaming Mod](docs/vn-mod-stream-gpu-infographic.webp)
 
 VN Mod Stream GPU is an experimental `llama.cpp` modification for running AI models that are larger than available GPU VRAM while keeping the main transformer computation on CUDA.
@@ -238,6 +240,8 @@ The files created for VN Mod Stream GPU under `mod/src` and `mod/tests` carry SP
 See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). This project is independent and is not an official `llama.cpp` feature.
 
 ---
+
+<a id="tieng-viet"></a>
 
 # Tiếng Việt
 
