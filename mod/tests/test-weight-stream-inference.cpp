@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 dienmaytientam-coder
+
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-ext.h"
