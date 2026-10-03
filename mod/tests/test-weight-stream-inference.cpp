@@ -54,7 +54,7 @@ static void dump_profile(const llama_weight_stream_model_profile & profile, int6
     for (const auto & tensor : profile.non_block_tensors) { emit(tensor); }
 }
 
-static llama_weight_stream_model_profile run(const char * filename, const std::string & root, bool stream, const llama_weight_stream_model_profile & discovered, bool paging, bool prefetch = false, bool automatic = false, const std::string & reserve = "2048M", const std::string & budget = "10.2G", const std::string & cache_dir = "/datas/serverai/cache/llama-weight-stream/gate7-validation", uint32_t n_ctx = 8192, const std::string & cache_type = "f16") {
+static llama_weight_stream_model_profile run(const char * filename, const std::string & root, bool stream, const llama_weight_stream_model_profile & discovered, bool paging, bool prefetch = false, bool automatic = false, const std::string & reserve = "2048M", const std::string & budget = "10.2G", const std::string & cache_dir = "", uint32_t n_ctx = 8192, const std::string & cache_type = "f16") {
     const std::string label = stream ? "stream" : "baseline";
     llama_weight_stream_config config;
     config.stream = stream;
@@ -88,7 +88,7 @@ static llama_weight_stream_model_profile run(const char * filename, const std::s
     options.mode = "auto";
     options.gpu_budget = llama_weight_stream_parse_size(budget);
     options.reserve = llama_weight_stream_parse_size(reserve,true);
-    options.cache_dir = cache_dir;
+    options.cache_dir = cache_dir.empty() ? root + "/cache" : cache_dir;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
         automatic && stream ? llama_weight_stream_load_auto(filename,mp,cp,options) : llama_model_load_from_file(filename,mp), llama_model_free);
     check(bool(model), "real model load failed");
@@ -237,7 +237,7 @@ int main(int argc, char ** argv) {
     const bool paging = mode == "--pager" || prefetch;
     const std::string reserve = argc >= 5 ? argv[4] : "2048M";
     const std::string budget = argc >= 6 ? argv[5] : "10.2G";
-    const std::string cache_dir = argc >= 7 ? argv[6] : mode == "--auto-target" ? "/datas/serverai/cache/llama-weight-stream" : "/datas/serverai/cache/llama-weight-stream/gate7-validation";
+    const std::string cache_dir = argc >= 7 ? argv[6] : "";
     if (!mode.empty() && !paging) { return 2; }
     try {
         ggml_backend_load_all();

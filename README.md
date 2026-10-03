@@ -4,7 +4,15 @@ This repository shares only the mod source, tests, and the integration patch for
 
 The patch targets upstream llama.cpp commit `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. See [`mod/README.md`](mod/README.md) for the file layout and installation steps.
 
-The mod is experimental. It requires CUDA and exactly one CUDA GPU. Unsupported model layouts and runtime options fail during load. Linux with CUDA is the tested environment; the current cache writer uses POSIX file operations. The config file and cache defaults still use `/datas/serverai/...` paths.
+After applying the patch and building `llama-server`, the minimal runtime form is:
+
+```sh
+./build-vn-mod-stream-gpu/bin/llama-server -m /path/to/model.gguf --vn-mod-gpu-wstream auto --parallel 1
+```
+
+The GPU budget is detected automatically when `--vn-mod-gpu` is omitted.
+
+The mod is experimental. The supported runtime path is Linux with CUDA and exactly one selected CUDA GPU. Unsupported model layouts and runtime options fail during load. The cache is portable by default and resolves through `VN_WSTREAM_CACHE_DIR`, `XDG_CACHE_HOME`, `HOME`, or the operating-system temporary directory.
 
 The upstream project remains under its MIT license. This repository includes the patch and mod files under MIT with upstream attribution in [`LICENSE`](LICENSE). This is not an official llama.cpp feature.
 

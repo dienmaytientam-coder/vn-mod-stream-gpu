@@ -51,6 +51,13 @@ static void gate7_contract(const llama_weight_stream_model_profile & fixture, gg
     for (const auto * value : {"", "-1", "1x", "1.2", "0", "18446744073709551616G", "1e3G"}) {
         rejects([&] { llama_weight_stream_parse_size(value); });
     }
+    const uint64_t gib = 1024ULL * 1024 * 1024;
+    check(llama_weight_stream_resolve_gpu_budget(0, 12 * gib, 2 * gib) == 12 * gib);
+    check(llama_weight_stream_resolve_gpu_budget(10 * gib, 12 * gib, 2 * gib) == 10 * gib);
+    rejects([&] { llama_weight_stream_resolve_gpu_budget(gib, 12 * gib, 2 * gib); });
+    rejects([&] { llama_weight_stream_resolve_gpu_budget(13 * gib, 12 * gib, 2 * gib); });
+    const auto portable_cache = llama_weight_stream_default_cache_dir();
+    check(!portable_cache.empty() && portable_cache.find("/datas/serverai") == std::string::npos);
     auto model = fixture;
     model.blocks.clear();
     for (int i = 0; i < 12; ++i) { model.blocks.push_back(llama_weight_stream_profile_block(i, {profile("weight" + std::to_string(i), i, 40)})); model.demand_order.push_back(i); }

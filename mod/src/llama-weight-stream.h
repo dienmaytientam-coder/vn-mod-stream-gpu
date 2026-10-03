@@ -140,8 +140,11 @@ struct llama_weight_stream_options {
     uint64_t external_cuda_bytes = 0;
     std::string runtime_key;
     bool cache = true;
-    std::string cache_dir = "/datas/serverai/cache/llama-weight-stream";
+    std::string cache_dir;
 };
+
+std::string llama_weight_stream_default_cache_dir();
+uint64_t llama_weight_stream_resolve_gpu_budget(uint64_t requested, uint64_t total_vram, uint64_t reserve);
 
 struct llama_weight_stream_model_identity {
     std::string canonical_path;

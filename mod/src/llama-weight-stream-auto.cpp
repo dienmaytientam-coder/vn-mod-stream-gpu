@@ -13,6 +13,7 @@
 #include <climits>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -43,6 +44,34 @@ static std::string ws_hash(const std::string & value) {
     uint64_t hash = 14695981039346656037ULL;
     for (unsigned char c : value) { hash = (hash ^ c) * 1099511628211ULL; }
     return std::to_string(hash);
+}
+std::string llama_weight_stream_default_cache_dir() {
+    if (const char * configured = std::getenv("VN_WSTREAM_CACHE_DIR"); configured && configured[0]) {
+        return configured;
+    }
+#if defined(_WIN32)
+    if (const char * local = std::getenv("LOCALAPPDATA"); local && local[0]) {
+        return (std::filesystem::path(local) / "vn-mod-stream-gpu").string();
+    }
+    if (const char * home = std::getenv("USERPROFILE"); home && home[0]) {
+        return (std::filesystem::path(home) / ".cache" / "vn-mod-stream-gpu").string();
+    }
+#else
+    if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0]) {
+        return (std::filesystem::path(xdg) / "vn-mod-stream-gpu").string();
+    }
+    if (const char * home = std::getenv("HOME"); home && home[0]) {
+        return (std::filesystem::path(home) / ".cache" / "vn-mod-stream-gpu").string();
+    }
+#endif
+    return (std::filesystem::temp_directory_path() / "vn-mod-stream-gpu").string();
+}
+uint64_t llama_weight_stream_resolve_gpu_budget(uint64_t requested, uint64_t total_vram, uint64_t reserve) {
+    const uint64_t budget = requested ? requested : total_vram;
+    if (!total_vram || budget <= reserve || budget > total_vram) {
+        throw std::invalid_argument("invalid GPU budget/reserve");
+    }
+    return budget;
 }
 uint64_t llama_weight_stream_parse_size(const std::string & value, bool allow_zero) {
     if (value.empty()) { throw std::invalid_argument("empty memory size"); }
@@ -442,6 +471,7 @@ llama_weight_stream_auto_plan_result llama_weight_stream_cached_plan(const llama
 
 llama_model * llama_weight_stream_load_auto(const char * path, llama_model_params params, llama_context_params cp, const llama_weight_stream_options & requested, const llama_context_params * draft_params, bool draft_backend_sampling) {
     auto opts = requested;
+    if (opts.cache_dir.empty()) { opts.cache_dir = llama_weight_stream_default_cache_dir(); }
     if (opts.mode == "off") { return llama_model_load_from_file(path,params); }
     if (params.tensor_buft_overrides && !params.tensor_buft_overrides[0].pattern) { params.tensor_buft_overrides = nullptr; }
     if (params.kv_overrides && !params.kv_overrides[0].key[0]) { params.kv_overrides = nullptr; }
@@ -457,7 +487,9 @@ llama_model * llama_weight_stream_load_auto(const char * path, llama_model_param
     char identity[128] = {};
     if (!get_hardware || !get_hardware(device,identity,sizeof(identity),&hw.compute_capability)) { throw std::invalid_argument("CUDA hardware profile is unavailable"); }
     hw.identity = identity;
-    if (opts.gpu_budget <= opts.reserve || opts.gpu_budget > hw.total_vram) { throw std::invalid_argument("invalid GPU budget/reserve"); }
+    opts.gpu_budget = llama_weight_stream_resolve_gpu_budget(opts.gpu_budget, hw.total_vram, opts.reserve);
+    fprintf(stderr, "vn-wstream: GPU budget=%llu%s cache_dir=%s\n",
+            (unsigned long long) opts.gpu_budget, requested.gpu_budget ? "" : " (auto)", opts.cache_dir.c_str());
     params.n_gpu_layers = INT_MAX; params.load_mode = LLAMA_LOAD_MODE_NONE; params.no_host = true;
     if (!params.devices) {
         size_t gpus = 0;

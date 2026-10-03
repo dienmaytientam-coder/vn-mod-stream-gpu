@@ -24,7 +24,7 @@ index 63e342776..52b3f1269 100644
 +    for (const auto & section : sections) {
 +        for (const auto & item : section.second) {
 +            if (section.first == "vn-mod" && item.first == "gpu") {
-+                params.vn_gpu_budget = llama_weight_stream_parse_size(item.second);
++                params.vn_gpu_budget = item.second == "auto" ? 0 : llama_weight_stream_parse_size(item.second);
 +            } else if (section.first == "vn-mod-gpu-wstream") {
 +                if (item.first == "mode") {
 +                    if (item.second != "off" && item.second != "auto") { throw std::invalid_argument("invalid weight stream mode"); }
@@ -58,7 +58,7 @@ index 63e342776..52b3f1269 100644
          }
      };
  
-+    add_opt(common_arg({"--vn-mod-gpu"}, "SIZE", "weight stream GPU upper budget (M/G are MiB/GiB; bare integer is MiB)",
++    add_opt(common_arg({"--vn-mod-gpu"}, "SIZE", "weight stream GPU upper budget (default: detected VRAM; M/G are MiB/GiB; bare integer is MiB)",
 +        [](common_params & params, const std::string & value) { params.vn_gpu_budget = llama_weight_stream_parse_size(value); }));
 +    add_opt(common_arg({"--vn-mod-gpu-wstream"}, "off|auto", "GPU weight streaming mode (default: off)",
 +        [](common_params & params, const std::string & value) {
@@ -145,7 +145,7 @@ index 7afc266ac..2ebff0ea1 100644
 +    uint64_t vn_wstream_reserve = 2048ULL * 1024 * 1024;
 +    uint64_t vn_wstream_external_cuda_bytes = 0;
 +    bool vn_wstream_cache = true;
-+    std::string vn_wstream_cache_dir = "/datas/serverai/cache/llama-weight-stream";
++    std::string vn_wstream_cache_dir;
 +
      int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
      int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
