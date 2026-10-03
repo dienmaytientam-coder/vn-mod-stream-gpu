@@ -1,18 +1,9 @@
 # VN GPU weight streaming mod
 
-This repository distributes the mod as a patch. It does not include the llama.cpp source tree, binaries, or model files.
+This repository shares only the mod source, tests, and the integration patch for llama.cpp. It does not contain the llama.cpp source tree, build output, binaries, or model files.
 
-The patch is based on upstream `llama.cpp` commit `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. Apply it to that exact checkout:
+The patch targets upstream llama.cpp commit `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. See [`mod/README.md`](mod/README.md) for the file layout and installation steps.
 
-```sh
-git clone https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp
-git checkout 73c941b11165cc0f7a36ba17380e79e8fe9797dc
-git apply /path/to/vn-mod-stream-gpu.patch
-cmake -S . -B /path/to/build-vn-mod-stream-gpu -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build /path/to/build-vn-mod-stream-gpu --target llama-server -j
-```
+The mod is experimental. It requires CUDA and exactly one CUDA GPU. Unsupported model layouts and runtime options fail during load. Linux with CUDA is the tested environment; the current cache writer uses POSIX file operations. The config file and cache defaults still use `/datas/serverai/...` paths.
 
-The mod is experimental. It requires CUDA and exactly one CUDA GPU. Unsupported model layouts and runtime options fail during load. The current cache writer uses POSIX file operations; Linux with CUDA is the tested environment. The config file currently uses `/datas/serverai/config/vn-gpu-wstream.conf` by default, and the default cache directory is `/datas/serverai/cache/llama-weight-stream`.
-
-The patch contains changes to upstream files and new mod files. The upstream project remains under its MIT license; this repository also provides the patch under the MIT license with attribution retained in `LICENSE`. The mod is not an official llama.cpp feature.
+The upstream project remains under its MIT license. This repository includes the patch and mod files under MIT with upstream attribution in [`LICENSE`](LICENSE). This is not an official llama.cpp feature.

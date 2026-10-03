@@ -1,0 +1,728 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63e342776..52b3f1269 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -11,6 +11,7 @@
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "preset.h"
++#include "../src/llama-weight-stream.h"
+ 
+ // fix problem with std::min and std::max
+ #if defined(_WIN32)
+@@ -713,6 +714,35 @@ void common_models_handler_apply(common_models_handler & handler, common_params
+ // CLI argument parsing functions
+ //
+ 
++void common_params_apply_vn_config(common_params & params, const std::string & path) {
++    std::error_code ec;
++    if (!std::filesystem::exists(path, ec)) {
++        if (ec) { throw std::runtime_error("cannot stat weight stream config: " + ec.message()); }
++        return;
++    }
++    const auto sections = common_read_ini(path);
++    for (const auto & section : sections) {
++        for (const auto & item : section.second) {
++            if (section.first == "vn-mod" && item.first == "gpu") {
++                params.vn_gpu_budget = llama_weight_stream_parse_size(item.second);
++            } else if (section.first == "vn-mod-gpu-wstream") {
++                if (item.first == "mode") {
++                    if (item.second != "off" && item.second != "auto") { throw std::invalid_argument("invalid weight stream mode"); }
++                    params.vn_wstream_mode = item.second;
++                } else if (item.first == "reserve") {
++                    params.vn_wstream_reserve = llama_weight_stream_parse_size(item.second, true);
++                } else if (item.first == "cache") {
++                    if (item.second != "true" && item.second != "false") { throw std::invalid_argument("invalid cache boolean"); }
++                    params.vn_wstream_cache = item.second == "true";
++                } else if (item.first == "cache_dir") {
++                    if (item.second.empty()) { throw std::invalid_argument("empty cache directory"); }
++                    params.vn_wstream_cache_dir = item.second;
++                } else { throw std::invalid_argument("unknown weight stream config key: " + item.first); }
++            }
++        }
++    }
++}
++
+ // apply config files (if present), a later file overrides an earlier one:
+ // 1. system-wide: /etc/llama.cpp/config.ini (%PROGRAMDATA%\llama.cpp\config.ini on windows)
+ // 2. user-level: ${XDG_CONFIG_HOME:-~/.config}/llama.cpp/config.ini (%APPDATA%\llama.cpp\config.ini on windows)
+@@ -767,6 +797,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+ 
+     // config file applies first, so env variables and CLI arguments override it
+     common_params_apply_system_config(params, ctx_arg.ex);
++    common_params_apply_vn_config(params, "/datas/serverai/config/vn-gpu-wstream.conf");
+ 
+     std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
+     for (auto & opt : ctx_arg.options) {
+@@ -1437,6 +1468,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     };
+ 
++    add_opt(common_arg({"--vn-mod-gpu"}, "SIZE", "weight stream GPU upper budget (M/G are MiB/GiB; bare integer is MiB)",
++        [](common_params & params, const std::string & value) { params.vn_gpu_budget = llama_weight_stream_parse_size(value); }));
++    add_opt(common_arg({"--vn-mod-gpu-wstream"}, "off|auto", "GPU weight streaming mode (default: off)",
++        [](common_params & params, const std::string & value) {
++            if (value != "off" && value != "auto") { throw std::invalid_argument("weight stream mode must be off or auto"); }
++            params.vn_wstream_mode = value;
++        }));
++    add_opt(common_arg({"--vn-mod-gpu-wstream-reserve"}, "SIZE", "headroom excluded from managed weights and two slots (default: 2048 MiB)",
++        [](common_params & params, const std::string & value) { params.vn_wstream_reserve = llama_weight_stream_parse_size(value, true); }));
+     add_opt(common_arg(
+         {"-h", "--help", "--usage"},
+         "print usage and exit",
+diff --git a/common/arg.h b/common/arg.h
+index 203d1b4e1..301f20b61 100644
+--- a/common/arg.h
++++ b/common/arg.h
+@@ -154,3 +154,5 @@ void common_models_handler_apply(common_models_handler & handler, common_params
+ 
+ // initialize argument parser context - used by test-arg-parser and preset
+ common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
++
++void common_params_apply_vn_config(common_params & params, const std::string & path);
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd9a..cfc069a63 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -6,6 +6,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
++#include "../src/llama-weight-stream.h"
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "unicode.h"
+@@ -1292,7 +1293,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
+-    if (params.fit_params) {
++    if (params.fit_params && params.vn_wstream_mode != "auto") {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+ 
+@@ -1326,7 +1327,29 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+     }
+ 
+-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    llama_model * model;
++    if (params.vn_wstream_mode == "auto") {
++        try {
++            const bool embedded_mtp = mparams.load_mtp;
++            if (!params.lora_adapters.empty() || params.speculative.has_dft() || params.speculative.has_synth() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP; })) { throw std::invalid_argument("weight streaming only supports resident embedded MTP speculation"); }
++            auto draft_params = common_context_params_to_llama(common_base_params_to_speculative(params));
++            draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++            draft_params.n_rs_seq = 0;
++            llama_weight_stream_options options;
++            options.mode = params.vn_wstream_mode;
++            options.gpu_budget = params.vn_gpu_budget;
++            options.reserve = params.vn_wstream_reserve;
++            options.external_cuda_bytes = params.vn_wstream_external_cuda_bytes;
++            options.cache = params.vn_wstream_cache;
++            options.cache_dir = params.vn_wstream_cache_dir;
++            model = llama_weight_stream_load_auto(params.model.path.c_str(), mparams, cparams, options, embedded_mtp ? &draft_params : nullptr, params.speculative.draft.backend_sampling);
++        } catch (const std::exception & e) {
++            COM_ERR("weight stream model load failed: %s\n", e.what());
++            return;
++        }
++    } else {
++        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    }
+     if (model == NULL) {
+         return;
+     }
+diff --git a/common/common.h b/common/common.h
+index 7afc266ac..2ebff0ea1 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -446,6 +446,13 @@ struct lr_opt {
+ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
+ 
+ struct common_params {
++    std::string vn_wstream_mode = "off";
++    uint64_t vn_gpu_budget = 0;
++    uint64_t vn_wstream_reserve = 2048ULL * 1024 * 1024;
++    uint64_t vn_wstream_external_cuda_bytes = 0;
++    bool vn_wstream_cache = true;
++    std::string vn_wstream_cache_dir = "/datas/serverai/cache/llama-weight-stream";
++
+     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
+     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
+diff --git a/common/preset.cpp b/common/preset.cpp
+index 4c61e93ee..c3a37c3ca 100644
+--- a/common/preset.cpp
++++ b/common/preset.cpp
+@@ -167,7 +167,7 @@ void common_preset::apply_to_params(common_params & params, const std::set<std::
+     }
+ }
+ 
+-static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_file(const std::string & path) {
++std::map<std::string, std::map<std::string, std::string>> common_read_ini(const std::string & path) {
+     std::map<std::string, std::map<std::string, std::string>> parsed;
+ 
+     if (!std::filesystem::exists(path)) {
+@@ -284,7 +284,7 @@ common_preset_context::common_preset_context(llama_example ex)
+ 
+ common_presets common_preset_context::load_from_ini(const std::string & path, common_preset & global) const {
+     common_presets out;
+-    auto ini_data = parse_ini_from_file(path);
++    auto ini_data = common_read_ini(path);
+ 
+     for (auto section : ini_data) {
+         common_preset preset;
+diff --git a/common/preset.h b/common/preset.h
+index d8fc3915b..24c2cc135 100644
+--- a/common/preset.h
++++ b/common/preset.h
+@@ -86,3 +86,5 @@ struct common_preset_context {
+     // apply presets over a base preset (same idea as CSS cascading)
+     common_presets cascade(const common_preset & base, const common_presets & presets) const;
+ };
++
++std::map<std::string, std::map<std::string, std::string>> common_read_ini(const std::string & path);
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535..5b1156f83 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2500,6 +2500,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.n_outputs_max = params.n_parallel;
+     result.n_outputs_max_per_seq = 1;
+ 
++    if (!has_draft && params.vn_wstream_mode == "auto" && std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
++        // Keep the resident draft workspace small while the target uses large prefill batches.
++        result.n_ubatch = 1;
++    }
++
+     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
+     // TODO: refactor such properties to be announced by the speculative types
+     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c8b23b2d5..a7794af44 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5677,8 +5677,42 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++static ggml_backend_event_t ggml_backend_cuda_event_new_timed(ggml_backend_dev_t dev) {
++    auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
++    ggml_cuda_set_device(ctx->device);
++    cudaEvent_t event;
++    CUDA_CHECK(cudaEventCreate(&event));
++    return new ggml_backend_event { dev, event };
++}
++
++static bool ggml_backend_cuda_event_query(ggml_backend_event_t event) {
++    const cudaError_t status = cudaEventQuery((cudaEvent_t) event->context);
++    if (status == cudaErrorNotReady) { return false; }
++    CUDA_CHECK(status);
++    return true;
++}
++
++static float ggml_backend_cuda_event_elapsed_ms(ggml_backend_event_t start, ggml_backend_event_t end) {
++    float ms = 0;
++    CUDA_CHECK(cudaEventElapsedTime(&ms, (cudaEvent_t) start->context, (cudaEvent_t) end->context));
++    return ms;
++}
++
++static bool ggml_backend_cuda_weight_stream_identity(ggml_backend_dev_t dev, char * identity, size_t capacity, int * cc) {
++    auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
++    cudaDeviceProp prop;
++    if (cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)) != cudaSuccess || capacity < 33) { return false; }
++    for (int i = 0; i < 16; ++i) { snprintf(identity + 2*i, capacity - 2*i, "%02x", (unsigned char) prop.uuid.bytes[i]); }
++    *cc = prop.major * 100 + prop.minor * 10;
++    return true;
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_cuda_weight_stream_identity") == 0) { return (void *) ggml_backend_cuda_weight_stream_identity; }
++    if (strcmp(name, "ggml_backend_event_new_timed") == 0) { return (void *) ggml_backend_cuda_event_new_timed; }
++    if (strcmp(name, "ggml_backend_event_query") == 0) { return (void *) ggml_backend_cuda_event_query; }
++    if (strcmp(name, "ggml_backend_event_elapsed_ms") == 0) { return (void *) ggml_backend_cuda_event_elapsed_ms; }
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_cuda_comm_init;
+     }
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc79..7febf0afb 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -39,6 +39,8 @@ set(LLAMA_CORE_SOURCES
+     llama-quant.cpp
+     llama-sampler.cpp
+     llama-vocab.cpp
++    llama-weight-stream.cpp
++    llama-weight-stream-auto.cpp
+     unicode-data.cpp
+     unicode.cpp
+ )
+@@ -69,6 +71,7 @@ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
++target_link_libraries(llama PRIVATE vendor::nlohmann)
+ 
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index fcd4dfb13..46bbd9834 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
++#include "llama-weight-stream.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
+@@ -97,6 +98,13 @@ llama_context::llama_context(
+ 
+     const auto & hparams = model.hparams;
+ 
++    if (model.weight_stream && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++        llama_weight_stream_config config;
++        config.cached_descriptors = true;
++        config.auto_plan.plan_key = "resident-mtp";
++        mtp_weight_stream = std::make_unique<llama_weight_stream_runtime>(config);
++    }
++
+     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+@@ -116,8 +124,8 @@ llama_context::llama_context(
+     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
+     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+     cparams.embeddings              = params.embeddings;
+-    cparams.embeddings_nextn        = false;
+-    cparams.embeddings_nextn_masked = false;
++    cparams.embeddings_nextn        = model.weight_stream && model.weight_stream->embedded_mtp();
++    cparams.embeddings_nextn_masked = cparams.embeddings_nextn && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+@@ -461,6 +469,16 @@ llama_context::llama_context(
+ 
+         sched_reserve();
+ 
++        if (model.weight_stream && !model.hparams.no_alloc) {
++            uint64_t runtime_bytes = 0;
++            for (const auto & item : memory_breakdown()) {
++                if (!ggml_backend_buft_is_host(item.first) && ggml_backend_dev_type(ggml_backend_buft_get_device(item.first)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                    runtime_bytes += item.second.context + item.second.compute;
++                }
++            }
++            model.weight_stream->check_context_memory(runtime_bytes, params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
++        }
++
+         if (!cparams.flash_attn) {
+             if (ggml_is_quantized(params.type_v)) {
+                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+@@ -482,6 +500,7 @@ llama_context::llama_context(
+ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
++    if (get_weight_stream() && !model.hparams.no_alloc) { get_weight_stream()->report_statistics(mtp_weight_stream ? "vn-wstream-mtp" : "vn-wstream"); }
+ 
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+@@ -810,6 +829,10 @@ ggml_backend_sched_t llama_context::get_sched() const {
+     return sched.get();
+ }
+ 
++llama_weight_stream_runtime * llama_context::get_weight_stream() const {
++    return mtp_weight_stream ? mtp_weight_stream.get() : model.weight_stream.get();
++}
++
+ uint32_t llama_context::n_ctx() const {
+     return cparams.n_ctx;
+ }
+@@ -1395,6 +1418,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    if (get_weight_stream()) { get_weight_stream()->begin_evaluation(sched.get()); }
++
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -2563,6 +2588,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.weight_stream =*/ get_weight_stream(),
+     };
+ }
+ 
+@@ -2585,6 +2611,13 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
++    if (get_weight_stream()) { get_weight_stream()->check_backends(gf, sched.get()); }
++
++    if (get_weight_stream() && get_weight_stream()->paging()) {
++        if (cparams.cb_eval) { throw std::invalid_argument("pager experiment cannot share an external eval callback"); }
++        ggml_backend_sched_set_eval_callback(sched.get(), llama_weight_stream_runtime::evaluation_callback, get_weight_stream());
++    }
++
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -2603,6 +2636,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
+             ggml_set_name(cur, name);
+         }
+ 
++        if (get_weight_stream()) {
++            const int block = cur->op == GGML_OP_GET_ROWS && cur->src[0] == model.tok_embd ? -1 : il;
++            get_weight_stream()->tag_node(cur, block);
++        }
++
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 77ef92fc6..b48aad909 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -17,6 +17,7 @@
+ 
+ struct llama_model;
+ class llama_batch_allocr;
++class llama_weight_stream_runtime;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -62,6 +63,7 @@ struct llama_context {
+     const llama_cparams & get_cparams() const;
+ 
+     ggml_backend_sched_t get_sched() const;
++    llama_weight_stream_runtime * get_weight_stream() const;
+ 
+     uint32_t n_ctx()     const;
+     uint32_t n_ctx_seq() const;
+@@ -332,6 +334,7 @@ private:
+ 
+     // reuse the batch_allocr to avoid unnecessary memory allocations
+     std::unique_ptr<llama_batch_allocr> balloc;
++    std::unique_ptr<llama_weight_stream_runtime> mtp_weight_stream;
+ 
+     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
+     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 07ca49ad0..290514b0b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
++#include "llama-weight-stream.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+@@ -1487,6 +1488,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     backend_cpu      (params.backend_cpu),
+     cvec             (params.cvec),
+     loras            (params.loras),
++    weight_stream    (params.weight_stream),
+     mctx             (params.mctx),
+     cross            (params.cross),
+     samplers         (params.samplers),
+@@ -1515,7 +1517,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    auto * effective = w;
++    if (weight_stream) {
++        weight_stream->observe_projection(w);
++        effective = weight_stream->resolve(w);
++    }
++    ggml_tensor * res = ggml_mul_mat(ctx0, effective, cur);
+ 
+     if (w_s) {
+         res = ggml_mul(ctx0, res, w_s);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc4110639..d3712dc89 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -93,6 +93,7 @@ struct llama_cross {
+ };
+ 
+ struct llm_graph_params;
++class llama_weight_stream_runtime;
+ 
+ //
+ // llm_graph_input
+@@ -809,6 +810,7 @@ struct llm_graph_params {
+     llm_graph_cb cb;
+ 
+     llm_graph_result * res;
++    llama_weight_stream_runtime * weight_stream = nullptr;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -880,7 +882,8 @@ struct llm_graph_params {
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+             loras == other.loras &&
+-            cross == other.cross;
++            cross == other.cross &&
++            weight_stream == other.weight_stream;
+     }
+ };
+ 
+@@ -1024,6 +1027,7 @@ struct llm_graph_context {
+ 
+     const llama_adapter_cvec     * cvec;
+     const llama_adapter_loras    * loras;
++    llama_weight_stream_runtime * weight_stream;
+     const llama_memory_context_i * mctx;
+     const llama_cross            * cross;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50d0..407907b2d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model.h"
++#include "llama-weight-stream.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+@@ -1208,6 +1209,9 @@ struct llama_model::impl {
+ };
+ 
+ llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
++    if (const auto * config = llama_weight_stream_current_config()) {
++        weight_stream = std::make_unique<llama_weight_stream_runtime>(*config);
++    }
+     if (params.tensor_split != nullptr) {
+         // llama_model_params stores tensor_split as a borrowed pointer, but the model
+         // may need it later for tensor-parallel KV-cache split metadata.
+@@ -1545,6 +1549,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // assign the output layer
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+ 
++    std::vector<std::string> stream_patterns;
++    std::vector<llama_model_tensor_buft_override> stream_overrides;
++    ggml_backend_dev_t stream_device = nullptr;
++    struct override_guard {
++        llama_model_loader & loader;
++        const llama_model_tensor_buft_override * previous;
++        ~override_guard() { loader.tensor_buft_overrides = previous; }
++    } restore_overrides{ml, ml.tensor_buft_overrides};
++    if (weight_stream && !weight_stream->selected_names().empty()) {
++        if (ml.use_mmap || !params.no_host || params.no_alloc || pimpl->has_tensor_overrides || devices.size() != 1) {
++            throw std::runtime_error("weight streaming experiment requires non-mmap, no_host, one GPU and no external overrides");
++        }
++        stream_device = pimpl->dev_layer.at(weight_stream->target_block()).dev;
++        auto host_buft = ggml_backend_dev_host_buffer_type(stream_device);
++        if (!host_buft) { throw std::runtime_error("selected block device has no pinned host buffer type"); }
++        for (const auto & name : weight_stream->selected_names()) {
++            std::string pattern = "^";
++            for (char ch : name) {
++                if (std::string(".\\^$|()[]{}*+?").find(ch) != std::string::npos) { pattern += '\\'; }
++                pattern += ch;
++            }
++            stream_patterns.push_back(pattern + "$");
++        }
++        for (const auto & pattern : stream_patterns) { stream_overrides.push_back({pattern.c_str(), host_buft}); }
++        stream_overrides.push_back({nullptr, nullptr});
++        ml.tensor_buft_overrides = stream_overrides.data();
++    }
++
+     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
+ 
+     // create tensors for the weights
+@@ -1873,6 +1905,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    if (stream_device) {
++        const auto temporary = weight_stream->initialize(stream_device, arch_name());
++        for (auto & item : pimpl->ctxs_bufs) {
++            auto & buffers = item.second;
++            buffers.erase(std::remove_if(buffers.begin(), buffers.end(), [&](const auto & buffer) {
++                return std::find(temporary.begin(), temporary.end(), buffer.get()) != temporary.end();
++            }), buffers.end());
++        }
++    }
++
++    if (const auto * config = llama_weight_stream_current_config()) {
++        if (config->cached_descriptors) {
++            size_t actual = 0;
++            for (const auto & item : pimpl->ctxs_bufs) {
++                for (const auto & buffer : item.second) {
++                    if (!ggml_backend_buffer_is_host(buffer.get())) { actual += ggml_backend_buffer_get_size(buffer.get()); }
++                }
++            }
++            const auto & plan = config->auto_plan;
++            fprintf(stderr, "vn-wstream: actual model CUDA=%zu actual slots=%llu expected managed=%llu\n", actual, (unsigned long long) plan.slot_bytes, (unsigned long long) plan.expected_bytes);
++            if (actual > plan.expected_bytes || actual + plan.slot_bytes + plan.extra_cuda_bytes - config->mtp_weight_cuda_bytes != plan.expected_bytes) { throw std::runtime_error("actual CUDA weight allocations differ from auto plan"); }
++        }
++    }
++
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+             pimpl->mappings.emplace_back(std::move(mapping));
+@@ -1884,9 +1940,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+-    return ml.create_tensor(
++    auto * tensor = ml.create_tensor(
+         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+         tn, ne, flags);
++    if (weight_stream) { weight_stream->register_tensor(tensor, tn.bid); }
++    return tensor;
+ }
+ 
+ std::string llama_model::arch_name() const {
+@@ -2760,6 +2818,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+ }
+ 
+ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
++    if (params.weight_stream) { params.weight_stream->begin_graph(); }
+     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+ 
+     // add on pooling layer
+@@ -2776,7 +2835,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+ 
+     llm->res->set_outputs(params);
+ 
+-    return llm->res->get_gf();
++    auto * graph = llm->res->get_gf();
++    if (params.weight_stream) { params.weight_stream->finish_graph(graph); }
++    return graph;
+ }
+ 
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 984b2cf38..e0223c334 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -17,6 +17,7 @@
+ struct llama_cparams;
+ struct llama_ubatch;
+ struct llama_model_loader;
++class llama_weight_stream_runtime;
+ 
+ // available models
+ enum llm_type {
+@@ -709,6 +710,8 @@ struct llama_model {
+     // for quantize-stats only
+     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+ 
++    std::unique_ptr<llama_weight_stream_runtime> weight_stream;
++
+     // for keeping track of associated LoRA adapters
+     std::unordered_set<llama_adapter_lora *> loras;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9b3a4fcc4..dc59bc603 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -324,6 +324,21 @@ endif()
+ 
+ if (NOT GGML_BACKEND_DL AND GGML_CPU)
+     # these tests use the backends directly and cannot be built with dynamic loading
++    add_executable(test-weight-stream test-weight-stream.cpp)
++    target_include_directories(test-weight-stream PRIVATE ../src)
++    target_link_libraries(test-weight-stream PRIVATE llama llama-common)
++    target_compile_features(test-weight-stream PRIVATE cxx_std_17)
++    llama_test(test-weight-stream)
++    add_executable(test-weight-stream-runtime test-weight-stream-runtime.cpp)
++    target_include_directories(test-weight-stream-runtime PRIVATE ../src)
++    target_link_libraries(test-weight-stream-runtime PRIVATE llama)
++    target_compile_features(test-weight-stream-runtime PRIVATE cxx_std_17)
++    llama_test(test-weight-stream-runtime)
++    add_executable(test-weight-stream-pager test-weight-stream-pager.cpp)
++    target_include_directories(test-weight-stream-pager PRIVATE ../src)
++    target_link_libraries(test-weight-stream-pager PRIVATE llama)
++    target_compile_features(test-weight-stream-pager PRIVATE cxx_std_17)
++    llama_test(test-weight-stream-pager)
+     llama_build_and_test(test-barrier.cpp)
+     llama_build_and_test(test-quantize-fns.cpp)
+     llama_build_and_test(test-quantize-perf.cpp)
+@@ -379,3 +394,6 @@ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+ endif()
++
++llama_build(test-weight-stream-inference.cpp)
++target_include_directories(test-weight-stream-inference PRIVATE ../src)
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b6835e434..2f2b349a3 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1061,30 +1061,41 @@ private:
+         }
+ 
+         // optionally get the memory usage of mmproj
+-        if (has_mmproj && params_base.fit_params) {
++        if (has_mmproj && (params_base.fit_params || params_base.vn_wstream_mode == "auto")) {
+             int64_t t_start = ggml_time_us();
+-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
++            auto estimate_params = mparams;
++            if (params_base.vn_wstream_mode == "auto") {
++                estimate_params.warmup = true;
++                params_base.vn_wstream_external_cuda_bytes = 0;
++            }
++            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), estimate_params);
+             int64_t t_elapsed = ggml_time_us() - t_start;
+             if (!mmproj_mem.empty()) {
+                 size_t total = 0;
+                 for (auto & [dev, size] : mmproj_mem) {
+                     total += size;
++                    if (params_base.vn_wstream_mode == "auto" && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                        params_base.vn_wstream_external_cuda_bytes += size;
++                    }
+                 }
+                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
+-                GGML_ASSERT(!params_base.fit_params_target.empty());
+-                for (auto & [dev, size] : mmproj_mem) {
+-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                        if (ggml_backend_dev_get(i) == dev) {
+-                            if (i < params_base.fit_params_target.size()) {
+-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+-                                params_base.fit_params_target[i] += size;
++                if (params_base.vn_wstream_mode != "auto") {
++                    GGML_ASSERT(!params_base.fit_params_target.empty());
++                    for (auto & [dev, size] : mmproj_mem) {
++                        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++                            if (ggml_backend_dev_get(i) == dev) {
++                                if (i < params_base.fit_params_target.size()) {
++                                    SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
++                                    params_base.fit_params_target[i] += size;
++                                }
++                                break;
+                             }
+-                            break;
+                         }
+                     }
+                 }
+             } else {
+                 SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
++                if (params_base.vn_wstream_mode == "auto") { return false; }
+             }
+         }
+ 
+@@ -2116,6 +2127,15 @@ private:
+         res->n_prompt_tokens       = slot.task->n_tokens();
+         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+         res->n_tokens_cached       = slot.prompt.n_tokens();
++        if (params_base.vn_wstream_mode == "auto") {
++            const auto memory = llama_get_memory(slot.ctx_tgt);
++            const auto draft_memory = slot.ctx_dft ? llama_get_memory(slot.ctx_dft) : nullptr;
++            LOG_INF("vn-wstream-population: task=%d cached_ledger=%d target_pos_min=%d target_pos_max=%d draft_pos_min=%d draft_pos_max=%d\n",
++                    slot.task->id, res->n_tokens_cached,
++                    llama_memory_seq_pos_min(memory, slot.id), llama_memory_seq_pos_max(memory, slot.id),
++                    draft_memory ? llama_memory_seq_pos_min(draft_memory, slot.id) : -1,
++                    draft_memory ? llama_memory_seq_pos_max(draft_memory, slot.id) : -1);
++        }
+         res->has_new_line          = slot.has_new_line;
+         res->stopping_word         = slot.stopping_word;
+         res->stop                  = slot.stop;
