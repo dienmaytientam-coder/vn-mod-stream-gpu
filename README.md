@@ -140,6 +140,31 @@ Manual budget example:
   --parallel 1
 ```
 
+### Weight-streaming parameters
+
+- `--vn-mod-gpu-wstream auto`  
+  Enables the automatic GPU weight-streaming path. The planner profiles the model, detects the selected CUDA GPU, calculates runtime CUDA usage, chooses which transformer blocks must remain resident or be streamed, and creates the reusable CUDA-slot plan. The default mode is `off`.
+
+- `--vn-mod-gpu 11G`  
+  Sets the **upper GPU-memory budget used by the streaming planner**. `G` means GiB and `M` means MiB. This is a ceiling, not a request to allocate exactly 11 GiB. If this option is omitted, VN Mod Stream GPU uses the detected total VRAM of the selected GPU as the upper budget.
+
+- `--vn-mod-gpu-wstream-reserve 2G`  
+  Keeps 2 GiB of safety headroom outside the streaming plan. This space helps absorb CUDA/runtime allocations and memory fluctuations instead of planning weights up to the absolute limit. The default reserve is 2048 MiB.
+
+The planner also accounts for runtime CUDA allocations and other detected CUDA memory usage. Conceptually:
+
+```text
+planner limit = GPU budget - reserve - accounted runtime/external CUDA usage
+```
+
+Example on a 12 GiB GPU:
+
+- `--vn-mod-gpu 12G --vn-mod-gpu-wstream-reserve 2G` → planner ceiling after reserve is about 10 GiB before additional accounted runtime/external CUDA usage.
+- `--vn-mod-gpu 11G --vn-mod-gpu-wstream-reserve 2G` → planner ceiling after reserve is about 9 GiB before additional accounted runtime/external CUDA usage.
+- Omitting `--vn-mod-gpu` on a detected 12 GiB GPU with the default 2 GiB reserve is approximately equivalent to using a 12 GiB upper budget with 2 GiB reserved.
+
+Use a larger reserve when you prefer more OOM safety. Use a smaller reserve only when you understand the CUDA memory requirements of the selected model and context.
+
 ## Cache
 
 Cache directory resolution order:
@@ -356,6 +381,31 @@ Ví dụ đặt thủ công:
   --vn-mod-gpu-wstream-reserve 2G \
   --parallel 1
 ```
+
+### Giải thích 3 tham số Weight Streaming
+
+- `--vn-mod-gpu-wstream auto`  
+  **Bật chế độ Auto GPU Weight Streaming.** Planner sẽ profile model, nhận diện CUDA GPU đang chọn, tính lượng CUDA memory cần cho runtime, quyết định block transformer nào giữ resident và block nào phải stream, sau đó tạo kế hoạch dùng các CUDA slot tái sử dụng. Mặc định tính năng này là `off`.
+
+- `--vn-mod-gpu 11G`  
+  Đặt **trần ngân sách GPU memory cho planner**. Ký hiệu `G` được hiểu là GiB, `M` là MiB. Đây là giới hạn tối đa để planner tính toán, **không có nghĩa là bắt buộc phải cấp phát đủ 11 GiB**. Nếu bỏ tham số này, VN Mod Stream GPU tự dùng tổng VRAM phát hiện được của GPU đang chọn làm trần ngân sách.
+
+- `--vn-mod-gpu-wstream-reserve 2G`  
+  Chừa **2 GiB vùng an toàn** ngoài kế hoạch streaming. Phần này giúp tránh planner sử dụng VRAM sát giới hạn tuyệt đối, tạo khoảng trống cho CUDA/runtime và dao động bộ nhớ trong lúc inference. Giá trị mặc định là 2048 MiB.
+
+Planner còn tính thêm CUDA memory của runtime và các allocation CUDA khác đã phát hiện. Có thể hiểu gần đúng:
+
+```text
+Giới hạn planner = GPU budget - reserve - runtime/external CUDA đã được tính
+```
+
+Ví dụ với GPU 12 GiB:
+
+- `--vn-mod-gpu 12G --vn-mod-gpu-wstream-reserve 2G` → sau reserve còn khoảng 10 GiB làm trần planner, trước khi trừ tiếp runtime/external CUDA đã được accounting.
+- `--vn-mod-gpu 11G --vn-mod-gpu-wstream-reserve 2G` → sau reserve còn khoảng 9 GiB làm trần planner, trước khi trừ tiếp runtime/external CUDA.
+- Nếu **không truyền** `--vn-mod-gpu`, GPU được phát hiện là 12 GiB và reserve mặc định 2 GiB, thì gần tương đương đặt upper budget 12 GiB và chừa 2 GiB reserve.
+
+Muốn an toàn OOM hơn thì tăng `reserve`. Chỉ nên giảm `reserve` khi đã hiểu rõ lượng CUDA memory mà model, context và các thành phần runtime cần sử dụng.
 
 ## Cache
 
