@@ -16,6 +16,16 @@ The mod is experimental. The supported runtime path is Linux with CUDA and exact
 
 The upstream project remains under its MIT license. This repository includes the patch and mod files under MIT with upstream attribution in [`LICENSE`](LICENSE). This is not an official llama.cpp feature.
 
+## Thông tin liên hệ
+
+**CÔNG TY TNHH TM KỸ THUẬT CÔNG NGHIỆP TIẾN TÂM**
+
+**MST:** 3703030204
+
+- 61/18A Đường Lê Văn Tiên, Khu phố Đông Chiêu, Dĩ An, Thành Phố Hồ Chí Minh
+- +84931855546 Ngọc Long
+- [dienmaytientam@gmail.com](mailto:dienmaytientam@gmail.com)
+
 ## License and upstream attribution
 
 This repository is distributed under the MIT License.
