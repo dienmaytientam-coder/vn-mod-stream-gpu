@@ -1,20 +1,390 @@
 # VN Mod Stream GPU
 
-This repository shares only the mod source, tests, and the integration patch for llama.cpp. It does not contain the llama.cpp source tree, build output, binaries, or model files.
+VN Mod Stream GPU is an experimental `llama.cpp` modification for running AI models that are larger than available GPU VRAM while keeping the main transformer computation on CUDA.
 
-The patch targets upstream llama.cpp commit `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. See [`mod/README.md`](mod/README.md) for the file layout and installation steps.
+The project is designed for single-GPU systems where VRAM is limited but users still need larger models, long context windows, Vision workloads, or integrated MTP.
 
-After applying the patch and building `llama-server`, the minimal runtime form is:
+> **Experimental community release:** the current implementation is shared so the community can test, improve, and extend it. At this time, only the models and hardware explicitly listed in the Tested section are declared as validated.
+
+## Overview
+
+The core idea is to replace traditional CPU-heavy offloading with a GPU weight-streaming path:
+
+**GGUF Model → Persistent Pinned RAM → Reusable CUDA Slots → GPU Compute**
+
+The streamed weights remain available in pinned host memory and are transferred asynchronously to reusable VRAM slots when needed. The transformer computation itself stays on CUDA instead of silently falling back to CPU.
+
+This design is intended for GPUs that do not have enough VRAM to hold the complete model while still allowing practical large-context inference.
+
+## Key features
+
+- **Automatic Weight Streaming** based on the configured or detected VRAM budget.
+- **Models larger than VRAM** can be loaded through streamed weight residency.
+- **Persistent pinned RAM** keeps streamed model weights available without re-reading the GGUF for every token.
+- **Two reusable CUDA slots** are used for streamed transformer blocks.
+- **Async H2D transfer + prefetch** overlaps host-to-device transfer with evaluation where possible.
+- **CUDA transformer compute** is enforced for the supported streaming path; unsupported layouts fail during load rather than silently CPU-offloading transformer work.
+- **Profile Cache + Plan Cache** reduce repeated profiling/planning work after a validated cache is created.
+- **Flash Attention** can be used with supported `llama.cpp` configurations.
+- **Q4_0 K/V cache** can be used in configurations such as the tested setup.
+- **Vision / mmproj accounting** is integrated into the server path so Vision memory is included in the VRAM plan.
+- **Integrated MTP** is supported for the resident embedded-MTP path.
+- Intended for **single-GPU PCs and workstations**, including 12 GB-class GPUs.
+
+## Why this approach
+
+Traditional RAM + CPU offloading reduces VRAM pressure by moving work away from the GPU, but that can significantly reduce inference performance.
+
+VN Mod Stream GPU instead focuses on the path:
+
+**RAM → VRAM → CUDA GPU**
+
+On the tested configuration, this approach provides better practical performance than CPU-heavy offloading because streamed model weights are moved into VRAM while transformer computation remains on the GPU.
+
+Actual performance depends on the model architecture, quantization, context size, PCIe bandwidth, CPU/RAM bandwidth, CUDA version, and GPU.
+
+## Tested configuration
+
+The current public test was performed with:
+
+- **GPU:** NVIDIA GeForce RTX 3060
+- **VRAM:** 12 GB
+- **Model:** Qwen3.8 27B
+- **Model source:** [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF)
+- **IQ2_S model size:** approximately **9.61 GB**
+- **IQ3_S model size:** approximately **12.1 GB**
+
+### Observed context results
+
+| Quantization | Model size | GPU | Observed context |
+| --- | ---: | --- | ---: |
+| IQ2_S | ~9.61 GB | RTX 3060 12 GB | ~250K |
+| IQ3_S | ~12.1 GB | RTX 3060 12 GB | ~124K |
+
+These context values are observations from the declared test environment, not a universal guarantee for every system or model.
+
+### Current tested scope
+
+The mod currently operates well on the declared tested models above.
+
+**No other model family is currently declared as tested.**
+
+Other GGUF models may work, but until they are actually validated they should be treated as untested.
+
+## Architecture highlights
+
+The current implementation includes the following ideas represented by the project design:
+
+1. The GGUF model is profiled.
+2. The planner calculates VRAM budget, runtime CUDA allocation, reserve, and external CUDA usage.
+3. Weights selected for streaming remain in persistent pinned RAM.
+4. Two reusable CUDA slots hold the currently required streamed blocks.
+5. Prefetch prepares future block demand asynchronously.
+6. H2D transfer can overlap with GPU evaluation.
+7. Transformer nodes in the supported path remain on CUDA.
+8. Profile and plan metadata can be cached for faster validated restarts.
+
+This is intended to make larger models and longer contexts practical on limited-VRAM GPUs without relying on CPU transformer offload.
+
+## Installation
+
+The integration patch targets this exact upstream `llama.cpp` revision:
+
+`73c941b11165cc0f7a36ba17380e79e8fe9797dc`
 
 ```sh
-./vn-mod-stream-gpu/bin/llama-server -m /path/to/model.gguf --vn-mod-gpu-wstream auto --parallel 1
+git clone https://github.com/dienmaytientam-coder/vn-mod-stream-gpu.git
+git clone https://github.com/ggml-org/llama.cpp.git
+
+cd llama.cpp
+git checkout 73c941b11165cc0f7a36ba17380e79e8fe9797dc
+
+cp ../vn-mod-stream-gpu/mod/src/llama-weight-stream* src/
+cp ../vn-mod-stream-gpu/mod/tests/test-weight-stream* tests/
+
+git apply --check ../vn-mod-stream-gpu/mod/integration.patch
+git apply ../vn-mod-stream-gpu/mod/integration.patch
+
+cmake -S . -B vn-mod-stream-gpu \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build vn-mod-stream-gpu --target llama-server -j
 ```
 
-The GPU budget is detected automatically when `--vn-mod-gpu` is omitted.
+Do not move an already configured CMake build directory. Configure it again with `-S` and `-B` if its location changes.
 
-The mod is experimental. The supported runtime path is Linux with CUDA and exactly one selected CUDA GPU. Unsupported model layouts and runtime options fail during load. The cache is portable by default and resolves through `VN_WSTREAM_CACHE_DIR`, `XDG_CACHE_HOME`, `HOME`, or the operating-system temporary directory.
+## Run
 
-The upstream project remains under its MIT license. This repository includes the patch and mod files under MIT with upstream attribution in [`LICENSE`](LICENSE). This is not an official llama.cpp feature.
+Minimal weight-streaming server command:
+
+```sh
+./vn-mod-stream-gpu/bin/llama-server \
+  -m /path/to/model.gguf \
+  --vn-mod-gpu-wstream auto \
+  --parallel 1
+```
+
+When `--vn-mod-gpu` is omitted, the mod uses the detected VRAM capacity of the selected CUDA GPU as the upper budget. Existing CUDA allocations and the reserve are still included in planner accounting.
+
+Manual budget example:
+
+```sh
+./vn-mod-stream-gpu/bin/llama-server \
+  -m /path/to/model.gguf \
+  --vn-mod-gpu-wstream auto \
+  --vn-mod-gpu 11G \
+  --vn-mod-gpu-wstream-reserve 2G \
+  --parallel 1
+```
+
+## Cache
+
+Cache directory resolution order:
+
+1. `VN_WSTREAM_CACHE_DIR`
+2. `$XDG_CACHE_HOME/vn-mod-stream-gpu`
+3. `$HOME/.cache/vn-mod-stream-gpu`
+4. Operating-system temporary directory
+
+Example:
+
+```sh
+VN_WSTREAM_CACHE_DIR=/mnt/fast-cache/vn-mod-stream-gpu \
+  ./vn-mod-stream-gpu/bin/llama-server \
+  -m /path/to/model.gguf \
+  --vn-mod-gpu-wstream auto \
+  --parallel 1
+```
+
+An optional `vn-gpu-wstream.conf` file can be placed in the process working directory.
+
+```ini
+[vn-mod]
+gpu=auto
+
+[vn-mod-gpu-wstream]
+mode=auto
+reserve=2048M
+cache=true
+cache_dir=/mnt/fast-cache/vn-mod-stream-gpu
+```
+
+## Current runtime constraints
+
+The project is experimental.
+
+Current supported/tested direction:
+
+- Linux
+- NVIDIA CUDA
+- exactly one selected CUDA GPU
+- single-sequence streaming path (`--parallel 1`)
+- declared tested model configuration above
+
+Current limitations include:
+
+- LoRA is not supported in the auto streaming path.
+- Non-MTP speculative modes are not supported in the auto streaming path.
+- Windows is not currently a supported runtime target.
+- Model layouts outside the supported streaming contract fail during load.
+- Models not listed in the Tested section have not yet been validated by this project.
+
+## Company and contact information
+
+**CÔNG TY TNHH TM KỸ THUẬT CÔNG NGHIỆP TIẾN TÂM**
+
+**Tax code / MST:** 3703030204
+
+- 61/18A Đường Lê Văn Tiên, Khu phố Đông Chiêu, Dĩ An, Thành Phố Hồ Chí Minh
+- +84931855546 — Ngọc Long
+- [dienmaytientam@gmail.com](mailto:dienmaytientam@gmail.com)
+
+## License and upstream attribution
+
+This repository is distributed under the MIT License.
+
+The files created for VN Mod Stream GPU under `mod/src` and `mod/tests` carry SPDX MIT identifiers and the project copyright notice.
+
+`mod/integration.patch` modifies existing files from `ggml-org/llama.cpp` and contains patch context from upstream revision `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. Upstream material remains copyright of the ggml authors and is used under the upstream MIT License.
+
+See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). This project is independent and is not an official `llama.cpp` feature.
+
+---
+
+# Tiếng Việt
+
+## Giới thiệu
+
+**VN Mod Stream GPU** là bản mod thử nghiệm trên nền `llama.cpp`, hướng tới việc chạy model AI có dung lượng lớn hơn VRAM của GPU trong khi vẫn giữ phần tính toán transformer chính trên CUDA.
+
+Dự án dành cho các hệ thống chỉ có một GPU, đặc biệt trong trường hợp GPU thiếu VRAM nhưng người dùng vẫn cần:
+
+- model lớn,
+- context dài,
+- Vision,
+- MTP,
+- và hiệu năng thực tế tốt hơn giải pháp offloading nặng sang CPU.
+
+> **Bản thử nghiệm chia sẻ cho cộng đồng:** dự án hiện được công khai để cộng đồng tiếp tục kiểm thử, cải tiến và phát triển. Hiện tại chỉ những model và phần cứng được liệt kê trong mục Tested mới được công bố là đã kiểm thử.
+
+## Cơ chế chính
+
+Luồng xử lý được thiết kế theo hướng:
+
+**GGUF Model → Persistent Pinned RAM → CUDA Slots → GPU Compute**
+
+Thay vì đưa transformer compute sang CPU khi VRAM không đủ, VN Mod Stream GPU giữ các weight cần stream trong pinned RAM, chuyển chúng sang các CUDA slot trong VRAM khi cần và tiếp tục tính toán trên GPU.
+
+## Tính năng
+
+- **Tự động Weight Streaming** theo ngân sách VRAM.
+- Có thể **tải model lớn vượt dung lượng VRAM**.
+- Hỗ trợ GPU thiếu VRAM nhưng vẫn hướng tới **context lớn**.
+- **Persistent pinned RAM** giữ weight đã chuẩn bị trong RAM, tránh đọc lại GGUF cho từng token.
+- **2 CUDA slot tái sử dụng** cho các transformer block được stream.
+- **Async H2D + Prefetch** để chồng lấp việc truyền RAM → VRAM với quá trình evaluation khi có thể.
+- Transformer compute trong đường streaming được hỗ trợ sẽ chạy trên **CUDA GPU**; cấu hình không hỗ trợ sẽ fail thay vì âm thầm offload transformer sang CPU.
+- **Profile Cache + Plan Cache** giúp giảm việc profile/planning lặp lại khi cache hợp lệ.
+- Có thể dùng **Flash Attention** theo cấu hình `llama.cpp` tương thích.
+- Có thể dùng **Q4_0 K/V Cache** như trong hướng cấu hình đã thử nghiệm.
+- Có tích hợp accounting cho **Vision / mmproj**.
+- Hỗ trợ hướng **embedded MTP** đã tích hợp.
+- Phù hợp cho PC/workstation 1 GPU, bao gồm GPU lớp **12 GB VRAM**.
+
+## Khác biệt so với RAM + CPU Offloading
+
+Offloading truyền thống giảm áp lực VRAM bằng cách chuyển một phần công việc sang RAM và CPU. Điều này có thể làm giảm đáng kể tốc độ inference.
+
+VN Mod Stream GPU tập trung vào luồng:
+
+**RAM → VRAM → CUDA GPU**
+
+Trong cấu hình đã test, hướng này cho hiệu năng thực tế tốt hơn kiểu CPU-heavy offloading vì weight được stream từ RAM vào VRAM, còn transformer compute tiếp tục chạy trên GPU.
+
+Tốc độ thực tế vẫn phụ thuộc vào model, quantization, context, PCIe, băng thông RAM/CPU, CUDA và GPU.
+
+## Cấu hình đã test
+
+Bản test công khai hiện tại sử dụng:
+
+- **GPU:** NVIDIA GeForce RTX 3060
+- **VRAM:** 12 GB
+- **Model:** Qwen3.8 27B
+- **Nguồn model:** [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF)
+- **IQ2_S:** khoảng **9.61 GB**
+- **IQ3_S:** khoảng **12.1 GB**
+
+### Kết quả context ghi nhận
+
+| Quantization | Dung lượng model | GPU | Context ghi nhận |
+| --- | ---: | --- | ---: |
+| IQ2_S | ~9.61 GB | RTX 3060 12 GB | ~250K |
+| IQ3_S | ~12.1 GB | RTX 3060 12 GB | ~124K |
+
+Đây là kết quả ghi nhận trên đúng môi trường thử nghiệm đã khai báo, không phải cam kết chung cho mọi máy hoặc mọi model.
+
+### Phạm vi tested hiện tại
+
+Bản mod hiện hoạt động tốt trên các model tested đã khai báo phía trên.
+
+**Hiện chưa thử nghiệm bất kỳ họ model nào khác.**
+
+Các GGUF khác có thể hoạt động, nhưng trước khi được test thực tế thì vẫn được xem là **untested**.
+
+## Điểm nổi bật về kiến trúc
+
+1. Profile model GGUF.
+2. Planner tính ngân sách VRAM, reserve, runtime CUDA allocation và external CUDA usage.
+3. Weight cần streaming được giữ trong persistent pinned RAM.
+4. Hai CUDA slot được tái sử dụng cho các block cần chạy.
+5. Prefetch chuẩn bị block sẽ được dùng tiếp theo.
+6. H2D có thể chạy chồng lấp với GPU evaluation.
+7. Transformer node trong đường hỗ trợ vẫn chạy CUDA.
+8. Profile/Plan cache hỗ trợ khởi động lại nhanh hơn sau khi đã tạo cache hợp lệ.
+
+Mục tiêu là giúp GPU VRAM hạn chế có thể chạy model lớn và context dài mà không phải phụ thuộc vào CPU transformer offload.
+
+## Cài đặt
+
+Patch hiện khóa theo đúng upstream commit:
+
+`73c941b11165cc0f7a36ba17380e79e8fe9797dc`
+
+```sh
+git clone https://github.com/dienmaytientam-coder/vn-mod-stream-gpu.git
+git clone https://github.com/ggml-org/llama.cpp.git
+
+cd llama.cpp
+git checkout 73c941b11165cc0f7a36ba17380e79e8fe9797dc
+
+cp ../vn-mod-stream-gpu/mod/src/llama-weight-stream* src/
+cp ../vn-mod-stream-gpu/mod/tests/test-weight-stream* tests/
+
+git apply --check ../vn-mod-stream-gpu/mod/integration.patch
+git apply ../vn-mod-stream-gpu/mod/integration.patch
+
+cmake -S . -B vn-mod-stream-gpu \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build vn-mod-stream-gpu --target llama-server -j
+```
+
+## Chạy
+
+Lệnh tối thiểu:
+
+```sh
+./vn-mod-stream-gpu/bin/llama-server \
+  -m /path/to/model.gguf \
+  --vn-mod-gpu-wstream auto \
+  --parallel 1
+```
+
+Nếu không truyền `--vn-mod-gpu`, mod tự dùng dung lượng VRAM được phát hiện của GPU đã chọn làm giới hạn trên. Planner vẫn tính reserve và CUDA allocation đang tồn tại.
+
+Ví dụ đặt thủ công:
+
+```sh
+./vn-mod-stream-gpu/bin/llama-server \
+  -m /path/to/model.gguf \
+  --vn-mod-gpu-wstream auto \
+  --vn-mod-gpu 11G \
+  --vn-mod-gpu-wstream-reserve 2G \
+  --parallel 1
+```
+
+## Cache
+
+Thứ tự xác định cache:
+
+1. `VN_WSTREAM_CACHE_DIR`
+2. `$XDG_CACHE_HOME/vn-mod-stream-gpu`
+3. `$HOME/.cache/vn-mod-stream-gpu`
+4. Thư mục temporary của hệ điều hành
+
+Có thể đặt `vn-gpu-wstream.conf` tại working directory nếu muốn dùng file cấu hình.
+
+## Giới hạn hiện tại
+
+Đây vẫn là dự án thử nghiệm.
+
+Hướng hỗ trợ/tested hiện tại:
+
+- Linux
+- NVIDIA CUDA
+- đúng một CUDA GPU được chọn
+- `--parallel 1`
+- model tested đã khai báo phía trên
+
+Các giới hạn hiện tại:
+
+- LoRA chưa được hỗ trợ trong auto streaming path.
+- Speculative mode ngoài embedded MTP chưa được hỗ trợ.
+- Windows hiện chưa phải runtime target được hỗ trợ.
+- Layout model ngoài streaming contract sẽ fail khi load.
+- Model không nằm trong danh sách Tested hiện chưa được dự án xác nhận.
 
 ## Thông tin liên hệ
 
@@ -23,16 +393,13 @@ The upstream project remains under its MIT license. This repository includes the
 **MST:** 3703030204
 
 - 61/18A Đường Lê Văn Tiên, Khu phố Đông Chiêu, Dĩ An, Thành Phố Hồ Chí Minh
-- +84931855546 Ngọc Long
+- +84931855546 — Ngọc Long
 - [dienmaytientam@gmail.com](mailto:dienmaytientam@gmail.com)
 
-## License and upstream attribution
+## Giấy phép
 
-This repository is distributed under the MIT License.
+Dự án được phát hành theo MIT License.
 
-The files created for the VN Mod Stream GPU under `mod/src` and `mod/tests` carry SPDX MIT identifiers and the project copyright notice.
+Phần upstream `llama.cpp` / `ggml` vẫn thuộc bản quyền của các tác giả upstream và tuân theo MIT License của upstream.
 
-`mod/integration.patch` modifies existing files from `ggml-org/llama.cpp` and contains patch context from upstream revision `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. Upstream material remains copyright of the ggml authors and is used under the upstream MIT License.
-
-See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the retained license text and provenance details. This project is independent and is not an official llama.cpp feature.
-
+Xem [`LICENSE`](LICENSE) và [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) để biết chi tiết.
