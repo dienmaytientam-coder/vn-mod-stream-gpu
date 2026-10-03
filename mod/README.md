@@ -19,8 +19,8 @@ cp ../vn-mod-stream-gpu/mod/tests/test-weight-stream* tests/
 git apply --check ../vn-mod-stream-gpu/mod/integration.patch
 git apply ../vn-mod-stream-gpu/mod/integration.patch
 
-cmake -S . -B build-vn-mod-stream-gpu -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-vn-mod-stream-gpu --target llama-server -j
+cmake -S . -B vn-mod-stream-gpu -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build vn-mod-stream-gpu --target llama-server -j
 ```
 
 Do not move an already configured CMake build directory. Configure it again with `-S` and `-B` if its location changes.
@@ -30,7 +30,7 @@ Do not move an already configured CMake build directory. Configure it again with
 Minimal weight-streaming server command:
 
 ```sh
-./build-vn-mod-stream-gpu/bin/llama-server \
+./vn-mod-stream-gpu/bin/llama-server \
   -m /path/to/model.gguf \
   --vn-mod-gpu-wstream auto \
   --parallel 1
@@ -41,7 +41,7 @@ When `--vn-mod-gpu` is omitted, the mod uses the detected VRAM capacity of the s
 To override the budget or reserve:
 
 ```sh
-./build-vn-mod-stream-gpu/bin/llama-server \
+./vn-mod-stream-gpu/bin/llama-server \
   -m /path/to/model.gguf \
   --vn-mod-gpu-wstream auto \
   --vn-mod-gpu 11G \
@@ -62,7 +62,7 @@ Example override:
 
 ```sh
 VN_WSTREAM_CACHE_DIR=/mnt/fast-cache/vn-mod-stream-gpu \
-  ./build-vn-mod-stream-gpu/bin/llama-server \
+  ./vn-mod-stream-gpu/bin/llama-server \
   -m /path/to/model.gguf \
   --vn-mod-gpu-wstream auto \
   --parallel 1

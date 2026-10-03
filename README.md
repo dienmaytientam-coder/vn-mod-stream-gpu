@@ -7,7 +7,7 @@ The patch targets upstream llama.cpp commit `73c941b11165cc0f7a36ba17380e79e8fe9
 After applying the patch and building `llama-server`, the minimal runtime form is:
 
 ```sh
-./build-vn-mod-stream-gpu/bin/llama-server -m /path/to/model.gguf --vn-mod-gpu-wstream auto --parallel 1
+./vn-mod-stream-gpu/bin/llama-server -m /path/to/model.gguf --vn-mod-gpu-wstream auto --parallel 1
 ```
 
 The GPU budget is detected automatically when `--vn-mod-gpu` is omitted.
