@@ -1,5 +1,7 @@
 # VN Mod Stream GPU
 
+![VN Mod Stream GPU — llama.cpp GPU Weight Streaming Mod](docs/vn-mod-stream-gpu-infographic.webp)
+
 VN Mod Stream GPU is an experimental `llama.cpp` modification for running AI models that are larger than available GPU VRAM while keeping the main transformer computation on CUDA.
 
 The project is designed for single-GPU systems where VRAM is limited but users still need larger models, long context windows, Vision workloads, or integrated MTP.
