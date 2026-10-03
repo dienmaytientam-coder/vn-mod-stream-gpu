@@ -49,6 +49,20 @@ To override the budget or reserve:
   --parallel 1
 ```
 
+### Weight-streaming parameters
+
+- `--vn-mod-gpu-wstream auto`: enables automatic GPU weight streaming. The default mode is `off`.
+- `--vn-mod-gpu 11G`: sets the planner's upper GPU-memory budget. `G` is GiB and `M` is MiB. If omitted, detected total VRAM is used.
+- `--vn-mod-gpu-wstream-reserve 2G`: reserves 2 GiB of safety headroom outside the streaming plan. Default: 2048 MiB.
+
+The planner also accounts for runtime and external CUDA allocations:
+
+```text
+planner limit = GPU budget - reserve - accounted runtime/external CUDA usage
+```
+
+For example, on a 12 GiB GPU, `--vn-mod-gpu 11G --vn-mod-gpu-wstream-reserve 2G` gives an approximately 9 GiB planner ceiling before additional runtime/external CUDA accounting.
+
 ## Cache
 
 The cache directory no longer depends on `/datas`. Resolution order is:
