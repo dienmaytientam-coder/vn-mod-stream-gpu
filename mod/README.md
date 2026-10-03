@@ -68,7 +68,20 @@ VN_WSTREAM_CACHE_DIR=/mnt/fast-cache/vn-mod-stream-gpu \
   --parallel 1
 ```
 
-An optional legacy INI file is still read from `/datas/serverai/config/vn-gpu-wstream.conf` when that file exists; it is not required for normal use. In the INI file, `gpu=auto` selects automatic budget detection.
+An optional `vn-gpu-wstream.conf` file is read from the process working directory when it exists; it is not required for normal use. For example:
+
+```ini
+[vn-mod]
+gpu=auto
+
+[vn-mod-gpu-wstream]
+mode=auto
+reserve=2048M
+cache=true
+cache_dir=/mnt/fast-cache/vn-mod-stream-gpu
+```
+
+In the INI file, `gpu=auto` selects automatic budget detection. CLI arguments still override config values.
 
 ## Current runtime constraints
 

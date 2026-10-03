@@ -50,7 +50,7 @@ index 63e342776..52b3f1269 100644
  
      // config file applies first, so env variables and CLI arguments override it
      common_params_apply_system_config(params, ctx_arg.ex);
-+    common_params_apply_vn_config(params, "/datas/serverai/config/vn-gpu-wstream.conf");
++    common_params_apply_vn_config(params, "vn-gpu-wstream.conf");
  
      std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
      for (auto & opt : ctx_arg.options) {
