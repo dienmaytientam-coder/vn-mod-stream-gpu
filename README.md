@@ -4,48 +4,184 @@
 
 ![VN Mod Stream GPU — llama.cpp GPU Weight Streaming Mod](docs/vn-mod-stream-gpu-infographic.webp)
 
-VN Mod Stream GPU is an experimental `llama.cpp` modification for running AI models that are larger than available GPU VRAM while keeping the main transformer computation on CUDA.
+VN Mod Stream GPU is an experimental `llama.cpp` modification for people who want to run **larger GGUF AI models on a single NVIDIA GPU even when the model does not fit completely inside VRAM**.
 
-The project is designed for single-GPU systems where VRAM is limited but users still need larger models, long context windows, Vision workloads, or integrated MTP.
+Instead of solving low VRAM mainly by moving transformer computation to the CPU, the mod keeps the supported transformer workload on CUDA and streams only the required model weights from system RAM into reusable VRAM space.
 
-> **Experimental community release:** the current implementation is shared so the community can test, improve, and extend it. At this time, only the models and hardware explicitly listed in the Tested section are declared as validated.
+The practical goal is simple: **use the RAM already available in the computer as a backing store for model weights, while preserving GPU computation as much as the supported model allows.**
 
-## Overview
+> **Experimental community release:** this project is shared so users and developers can test, improve, and extend it. At this time, only the models and hardware explicitly listed in the Tested section are declared as validated.
 
-The core idea is to replace traditional CPU-heavy offloading with a GPU weight-streaming path:
+## What problem does it solve?
 
-**GGUF Model → Persistent Pinned RAM → Reusable CUDA Slots → GPU Compute**
+A common limitation of local AI is that a useful model may be larger than the GPU's VRAM.
 
-The streamed weights remain available in pinned host memory and are transferred asynchronously to reusable VRAM slots when needed. The transformer computation itself stays on CUDA instead of silently falling back to CPU.
+For example, a 12 GB GPU must hold not only model weights, but also context/KV cache, CUDA runtime memory, Vision/mmproj memory, MTP memory when used, and temporary compute buffers. Even a model whose file size appears close to 12 GB can therefore run out of VRAM when context grows.
 
-This design is intended for GPUs that do not have enough VRAM to hold the complete model while still allowing practical large-context inference.
+Traditional CPU/RAM offloading can make the model fit, but moving transformer work to the CPU can reduce inference speed significantly.
 
-## Key features
+VN Mod Stream GPU takes a different approach:
 
-- **Automatic Weight Streaming** based on the configured or detected VRAM budget.
-- **Models larger than VRAM** can be loaded through streamed weight residency.
-- **Persistent pinned RAM** keeps streamed model weights available without re-reading the GGUF for every token.
-- **Two reusable CUDA slots** are used for streamed transformer blocks.
-- **Async H2D transfer + prefetch** overlaps host-to-device transfer with evaluation where possible.
-- **CUDA transformer compute** is enforced for the supported streaming path; unsupported layouts fail during load rather than silently CPU-offloading transformer work.
-- **Profile Cache + Plan Cache** reduce repeated profiling/planning work after a validated cache is created.
-- **Flash Attention** can be used with supported `llama.cpp` configurations.
-- **Q4_0 K/V cache** can be used in configurations such as the tested setup.
-- **Vision / mmproj accounting** is integrated into the server path so Vision memory is included in the VRAM plan.
-- **Integrated MTP** is supported for the resident embedded-MTP path.
-- Intended for **single-GPU PCs and workstations**, including 12 GB-class GPUs.
+**System RAM stores the streamed weights → VRAM receives the blocks currently needed → CUDA performs the supported transformer computation.**
 
-## Why this approach
+This allows VRAM to behave more like a high-speed working area rather than requiring the entire model to stay there at once.
 
-Traditional RAM + CPU offloading reduces VRAM pressure by moving work away from the GPU, but that can significantly reduce inference performance.
+## What can users use it for?
 
-VN Mod Stream GPU instead focuses on the path:
+The current design is useful for single-GPU systems where VRAM is the limiting resource, especially for workloads such as:
+
+- **Running a GGUF model larger than available VRAM** on supported model layouts.
+- **Long-context chat and assistants**, where KV/context memory would otherwise leave too little VRAM for model weights.
+- **AI coding and large codebase analysis**, where long prompts and repository context can consume substantial memory.
+- **RAG and long-document workloads**, where larger context windows are useful for keeping more retrieved information in one request.
+- **Vision workloads**, where mmproj/Vision memory also competes for VRAM and is included in the server-side memory accounting.
+- **Embedded MTP models**, where the supported resident MTP path is accounted for together with the target model.
+- **Local or internal `llama-server` deployments** on one NVIDIA GPU, including consumer GPUs in the 12 GB class.
+
+These are intended use cases. Compatibility still depends on the model layout and the Tested section below should be treated as the current validated scope.
+
+## What the user gets
+
+### 1. Load models that do not fully fit in VRAM
+
+The mod can keep selected model weights in system RAM and move only the transformer blocks required for the current computation into VRAM.
+
+This means the model no longer needs to keep every streamable weight resident on the GPU at the same time.
+
+### 2. Keep supported transformer compute on the GPU
+
+The goal is not merely to make a large model load. The supported streaming path keeps transformer computation on CUDA rather than silently moving those transformer operations to the CPU.
+
+That is the main difference from CPU-heavy offloading.
+
+### 3. More room for long context
+
+VRAM is also needed by the KV cache and other runtime allocations. By reducing how much model-weight memory must remain resident at once, more of the GPU memory budget can be left available for context and runtime needs.
+
+The actual context limit still depends on the model, quantization, KV-cache type, batch settings, Vision/MTP usage, and system hardware.
+
+### 4. Automatic VRAM planning
+
+With:
+
+```sh
+--vn-mod-gpu-wstream auto
+```
+
+the mod inspects the model and selected CUDA GPU, accounts for the configured VRAM budget and reserve, estimates runtime CUDA use, and decides which supported transformer blocks need streaming.
+
+The user does not have to manually choose individual layers or blocks to stream.
+
+### 5. Persistent pinned RAM
+
+Streamed weights are kept in pinned host memory so they can be transferred efficiently to the GPU when required.
+
+They are not intentionally re-read from the GGUF file for every generated token.
+
+### 6. Reusable CUDA slots
+
+The current implementation uses two reusable CUDA slots for streamed transformer blocks.
+
+Instead of permanently allocating VRAM for every streamed block, those slots are reused as inference moves through the model.
+
+### 7. Async transfer and prefetch
+
+While the GPU is processing the current supported block, the runtime can prepare the next required block and transfer weights from host memory toward VRAM.
+
+The purpose is to hide part of the RAM-to-GPU transfer cost behind useful GPU work when the execution path permits it.
+
+### 8. Profile Cache and Plan Cache
+
+The first validated run may need to inspect the model and build a streaming plan.
+
+The resulting profile and plan can be cached. When the model identity, hardware and relevant runtime configuration still match, later starts can reuse valid cached information instead of repeating all profiling/planning work.
+
+### 9. Vision memory accounting
+
+When Vision/mmproj is used through the integrated server path, its estimated GPU memory usage is included in the streaming budget instead of being ignored.
+
+This helps prevent a plan that looks valid for text-only inference but leaves too little VRAM once Vision is loaded.
+
+### 10. Embedded MTP support
+
+The current supported speculative path is resident **embedded MTP**. Its model/runtime CUDA requirements are included in the memory accounting.
+
+Other speculative configurations are currently outside the supported auto-streaming path.
+
+### 11. Works with useful llama.cpp memory optimizations
+
+The mod is designed to coexist with compatible `llama.cpp` runtime choices such as **Flash Attention** and quantized **K/V cache** configurations, including the Q4_0 K/V-cache direction used in testing.
+
+These features remain `llama.cpp` options; VN Mod Stream GPU does not replace them.
+
+## How it works in practice
+
+A simple way to think about it is:
+
+- **System RAM = model-weight storage area**
+- **VRAM = fast working area**
+- **CUDA GPU = compute engine**
+
+During startup and inference:
+
+1. **The model is inspected.**  
+   VN Mod Stream GPU identifies the supported transformer structure and determines which weights are eligible for streaming.
+
+2. **VRAM needs are calculated.**  
+   The runtime considers the GPU budget, safety reserve, context/runtime CUDA allocations, and supported external allocations such as Vision or embedded MTP.
+
+3. **Weights that do not need permanent VRAM residency stay in pinned RAM.**  
+   This gives the runtime a fast host-memory source without repeatedly reading the model file.
+
+4. **Two VRAM slots are prepared.**  
+   Only the streamed transformer blocks needed around the current execution point occupy these reusable slots.
+
+5. **The next block can be prefetched.**  
+   While CUDA computes the current work, the runtime can prepare the next required weight block.
+
+6. **The slot is reused.**  
+   After a streamed block is no longer needed, the same VRAM area can be reused for another block later in the model.
+
+7. **The transformer computation remains on CUDA for the supported path.**  
+   If the model/runtime layout does not satisfy the streaming contract, loading fails instead of silently changing to an unsupported execution path.
+
+8. **A valid plan can be reused on restart.**  
+   Profile/Plan Cache reduces repeated setup work when the same model, hardware and relevant configuration are used again.
+
+In short:
+
+**GGUF on storage → selected weights kept in pinned RAM → required blocks streamed into reusable VRAM → CUDA performs transformer compute.**
+
+## Why this can be faster than CPU-heavy offloading
+
+CPU offloading often reduces VRAM usage by moving both data and part of the computation away from the GPU.
+
+VN Mod Stream GPU instead focuses on moving **weights** through:
 
 **RAM → VRAM → CUDA GPU**
 
-On the tested configuration, this approach provides better practical performance than CPU-heavy offloading because streamed model weights are moved into VRAM while transformer computation remains on the GPU.
+while keeping supported transformer compute on CUDA.
 
-Actual performance depends on the model architecture, quantization, context size, PCIe bandwidth, CPU/RAM bandwidth, CUDA version, and GPU.
+On the declared tested configuration, this provides better practical performance than the CPU-heavy offloading path used for comparison. It does **not** mean RAM-to-VRAM streaming is free: performance still depends heavily on PCIe bandwidth, RAM bandwidth, CPU/platform, model architecture, quantization, context size and GPU.
+
+## Feature summary
+
+| Capability | What it means for the user |
+| --- | --- |
+| Auto Weight Streaming | No manual block/layer selection for the supported auto path |
+| Model larger than VRAM | Streamable weights can remain in RAM instead of all occupying VRAM |
+| Long-context headroom | Reduces permanent weight pressure so more budget can be available for KV/runtime memory |
+| Persistent pinned RAM | Keeps prepared weights in host memory for efficient repeated GPU transfers |
+| 2 reusable CUDA slots | Reuses limited VRAM space for different transformer blocks |
+| Async H2D + Prefetch | Attempts to overlap weight transfer with GPU execution |
+| CUDA transformer compute | Supported transformer path remains on the GPU |
+| Profile + Plan Cache | Reuses validated model/planning information on later starts |
+| Vision/mmproj accounting | Includes supported Vision GPU memory in the budget |
+| Embedded MTP | Accounts for the supported resident embedded-MTP path |
+| Flash Attention compatibility | Can be combined with compatible llama.cpp Flash Attention settings |
+| Quantized K/V cache compatibility | Can be combined with compatible llama.cpp K/V-cache settings |
+| llama-server integration | Exposes the mod through the normal server workflow after patch/build |
+| Single-GPU focus | Designed around one selected CUDA GPU |
 
 ## Tested configuration
 
@@ -75,20 +211,19 @@ The mod currently operates well on the declared tested models above.
 
 Other GGUF models may work, but until they are actually validated they should be treated as untested.
 
-## Architecture highlights
+## Before you use it
 
-The current implementation includes the following ideas represented by the project design:
+VN Mod Stream GPU is intended to make limited-VRAM hardware more useful, but it does not turn system RAM into VRAM and it does not remove the physical cost of PCIe transfers.
 
-1. The GGUF model is profiled.
-2. The planner calculates VRAM budget, runtime CUDA allocation, reserve, and external CUDA usage.
-3. Weights selected for streaming remain in persistent pinned RAM.
-4. Two reusable CUDA slots hold the currently required streamed blocks.
-5. Prefetch prepares future block demand asynchronously.
-6. H2D transfer can overlap with GPU evaluation.
-7. Transformer nodes in the supported path remain on CUDA.
-8. Profile and plan metadata can be cached for faster validated restarts.
+For best results, users should consider:
 
-This is intended to make larger models and longer contexts practical on limited-VRAM GPUs without relying on CPU transformer offload.
+- **Enough system RAM** to hold the streamed model weights plus the operating system and other applications.
+- **Fast RAM and PCIe bandwidth**, because streamed weights must travel from host memory to the GPU.
+- **A sensible VRAM reserve**, especially with large context, Vision or MTP.
+- **The tested model scope**, because unsupported model layouts are intentionally rejected instead of being allowed to run incorrectly.
+- **Context size versus speed**, since extremely large context can increase runtime memory use and reduce overall performance.
+
+The project is designed to make this trade-off automatic and practical, not to claim that a 12 GB GPU behaves identically to a GPU with enough VRAM to hold the entire model.
 
 ## Installation
 
@@ -247,53 +382,199 @@ See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Giới thiệu
 
-**VN Mod Stream GPU** là bản mod thử nghiệm trên nền `llama.cpp`, hướng tới việc chạy model AI có dung lượng lớn hơn VRAM của GPU trong khi vẫn giữ phần tính toán transformer chính trên CUDA.
+**VN Mod Stream GPU** dành cho người dùng muốn chạy **model GGUF lớn trên một GPU NVIDIA có VRAM hạn chế**, kể cả khi toàn bộ model không thể nằm cùng lúc trong VRAM.
 
-Dự án dành cho các hệ thống chỉ có một GPU, đặc biệt trong trường hợp GPU thiếu VRAM nhưng người dùng vẫn cần:
+Ví dụ thực tế: GPU 12 GB không chỉ phải chứa weight của model. VRAM còn phải dành cho context/KV cache, CUDA runtime, buffer tính toán, Vision/mmproj và MTP nếu sử dụng. Vì vậy một file model có dung lượng gần 12 GB vẫn có thể thiếu VRAM khi context tăng.
 
-- model lớn,
-- context dài,
-- Vision,
-- MTP,
-- và hiệu năng thực tế tốt hơn giải pháp offloading nặng sang CPU.
+Cách phổ biến để giải quyết là offload sang RAM + CPU. Model có thể chạy được nhưng tốc độ thường giảm mạnh nếu transformer compute phải chuyển sang CPU.
 
-> **Bản thử nghiệm chia sẻ cho cộng đồng:** dự án hiện được công khai để cộng đồng tiếp tục kiểm thử, cải tiến và phát triển. Hiện tại chỉ những model và phần cứng được liệt kê trong mục Tested mới được công bố là đã kiểm thử.
+VN Mod Stream GPU đi theo hướng khác:
 
-## Cơ chế chính
+**RAM giữ các weight cần stream → VRAM chỉ nhận block đang cần → CUDA GPU tiếp tục thực hiện transformer compute trong đường được hỗ trợ.**
 
-Luồng xử lý được thiết kế theo hướng:
+Nói đơn giản, VRAM được sử dụng như một **vùng làm việc tốc độ cao**, thay vì bắt buộc phải chứa toàn bộ weight của model trong suốt quá trình chạy.
 
-**GGUF Model → Persistent Pinned RAM → CUDA Slots → GPU Compute**
+> **Bản thử nghiệm chia sẻ cho cộng đồng:** dự án được công khai để người dùng và developer cùng kiểm thử, cải tiến và mở rộng. Hiện tại chỉ model và phần cứng ghi trong mục Tested được xem là đã xác nhận.
 
-Thay vì đưa transformer compute sang CPU khi VRAM không đủ, VN Mod Stream GPU giữ các weight cần stream trong pinned RAM, chuyển chúng sang các CUDA slot trong VRAM khi cần và tiếp tục tính toán trên GPU.
+## Dự án giải quyết vấn đề gì?
 
-## Tính năng
+Nếu bạn có GPU VRAM thấp nhưng RAM hệ thống còn nhiều, VN Mod Stream GPU hướng tới việc giúp bạn:
 
-- **Tự động Weight Streaming** theo ngân sách VRAM.
-- Có thể **tải model lớn vượt dung lượng VRAM**.
-- Hỗ trợ GPU thiếu VRAM nhưng vẫn hướng tới **context lớn**.
-- **Persistent pinned RAM** giữ weight đã chuẩn bị trong RAM, tránh đọc lại GGUF cho từng token.
-- **2 CUDA slot tái sử dụng** cho các transformer block được stream.
-- **Async H2D + Prefetch** để chồng lấp việc truyền RAM → VRAM với quá trình evaluation khi có thể.
-- Transformer compute trong đường streaming được hỗ trợ sẽ chạy trên **CUDA GPU**; cấu hình không hỗ trợ sẽ fail thay vì âm thầm offload transformer sang CPU.
-- **Profile Cache + Plan Cache** giúp giảm việc profile/planning lặp lại khi cache hợp lệ.
-- Có thể dùng **Flash Attention** theo cấu hình `llama.cpp` tương thích.
-- Có thể dùng **Q4_0 K/V Cache** như trong hướng cấu hình đã thử nghiệm.
-- Có tích hợp accounting cho **Vision / mmproj**.
-- Hỗ trợ hướng **embedded MTP** đã tích hợp.
-- Phù hợp cho PC/workstation 1 GPU, bao gồm GPU lớp **12 GB VRAM**.
+- chạy model lớn hơn khả năng chứa trực tiếp của VRAM;
+- dành thêm VRAM cho context/KV cache;
+- giữ transformer compute trên CUDA thay vì offload nặng sang CPU;
+- sử dụng Vision hoặc embedded MTP mà planner vẫn tính phần VRAM liên quan;
+- chạy `llama-server` trên một GPU phổ thông thay vì bắt buộc nâng cấp ngay lên GPU VRAM lớn hơn.
 
-## Khác biệt so với RAM + CPU Offloading
+Mod không biến RAM thành VRAM và cũng không loại bỏ chi phí truyền dữ liệu qua PCIe. Mục tiêu là **quản lý phần VRAM hạn chế hiệu quả hơn và chỉ đưa weight cần thiết vào GPU đúng lúc**.
 
-Offloading truyền thống giảm áp lực VRAM bằng cách chuyển một phần công việc sang RAM và CPU. Điều này có thể làm giảm đáng kể tốc độ inference.
+## Có thể áp dụng vào đâu?
 
-VN Mod Stream GPU tập trung vào luồng:
+Với model/layout được hỗ trợ, dự án phù hợp cho các nhu cầu như:
+
+- **Chat AI local với model lớn:** dùng model vượt VRAM nhưng vẫn chạy trên một GPU.
+- **AI Coding / phân tích codebase lớn:** dành thêm bộ nhớ cho prompt và context dài khi đưa nhiều source code vào model.
+- **RAG / đọc tài liệu dài:** giữ được nhiều nội dung truy xuất hơn trong context thay vì phải giảm model chỉ vì thiếu VRAM.
+- **Phân tích tài liệu, log, source code dài:** hữu ích khi workload phụ thuộc mạnh vào context.
+- **Vision:** planner có accounting cho mmproj/Vision memory trong đường server tích hợp.
+- **Model có embedded MTP:** phần weight/runtime của MTP được tính trong kế hoạch bộ nhớ hiện được hỗ trợ.
+- **Server AI nội bộ:** dùng `llama-server` làm API trên máy cá nhân/workstation một GPU.
+- **Máy dùng GPU phổ thông 12 GB:** đây là nhóm phần cứng mà dự án đang hướng tới và RTX 3060 12 GB là cấu hình đã test.
+
+Các mục trên là **trường hợp sử dụng hướng tới**. Khả năng tương thích thực tế vẫn phụ thuộc model; hãy xem mục Tested để biết phạm vi đã xác nhận.
+
+## Người dùng nhận được gì?
+
+### 1. Có thể tải model lớn hơn VRAM
+
+Không cần toàn bộ weight có thể stream phải nằm thường trực trong VRAM.
+
+Một phần weight được giữ trong RAM và chỉ được đưa vào VRAM khi transformer block tương ứng cần chạy.
+
+### 2. Transformer compute vẫn chạy trên GPU
+
+Mục tiêu không chỉ là “load được model”.
+
+Trong đường streaming được hỗ trợ, transformer compute tiếp tục chạy trên CUDA. Mod không âm thầm chuyển các transformer operation đó sang CPU để đổi lấy việc tiết kiệm VRAM.
+
+Đây là khác biệt quan trọng so với CPU-heavy offloading.
+
+### 3. Có thêm khoảng VRAM cho context
+
+Context dài cần nhiều KV-cache/runtime memory.
+
+Khi giảm lượng weight phải nằm thường trực trong VRAM, GPU có thể dành nhiều ngân sách bộ nhớ hơn cho context và các allocation runtime khác.
+
+Context tối đa thực tế vẫn phụ thuộc model, quantization, K/V cache, batch, Vision/MTP và phần cứng.
+
+### 4. Tự động tính kế hoạch VRAM
+
+Khi bật:
+
+```sh
+--vn-mod-gpu-wstream auto
+```
+
+VN Mod Stream GPU tự kiểm tra model và GPU, tính budget/reserve/runtime memory rồi quyết định block nào phải stream.
+
+Người dùng không cần tự chọn từng layer hoặc transformer block để chuyển sang RAM.
+
+### 5. Weight được giữ trong pinned RAM
+
+Các weight cần streaming được giữ trong pinned host memory để có thể chuyển sang GPU hiệu quả hơn.
+
+Thiết kế không chủ động đọc lại weight từ file GGUF cho mỗi token.
+
+### 6. Hai CUDA slot được tái sử dụng
+
+Thay vì dành VRAM cố định cho tất cả block được stream, runtime dùng hai vùng CUDA có thể tái sử dụng.
+
+Block cần chạy được đưa vào slot, dùng xong slot có thể được dùng lại cho block khác.
+
+### 7. Async H2D + Prefetch
+
+Runtime có thể chuẩn bị block tiếp theo trong khi GPU đang xử lý block hiện tại.
+
+Mục tiêu là chồng lấp một phần thời gian truyền **RAM → VRAM** với thời gian GPU đang làm việc, thay vì luôn phải chờ tuần tự.
+
+### 8. Profile Cache + Plan Cache
+
+Lần chạy đầu hợp lệ có thể cần profile model và tạo kế hoạch streaming.
+
+Thông tin đó được cache. Khi model, GPU và cấu hình liên quan vẫn phù hợp, lần khởi động sau có thể dùng lại cache thay vì làm lại toàn bộ quá trình.
+
+### 9. Có tính VRAM cho Vision/mmproj
+
+Nếu dùng Vision trong đường server tích hợp, planner không giả định toàn bộ VRAM còn lại chỉ dành cho model text.
+
+Phần memory ước tính của mmproj/Vision được đưa vào accounting để giảm nguy cơ lập một kế hoạch chỉ chạy được text nhưng thiếu VRAM khi bật Vision.
+
+### 10. Hỗ trợ embedded MTP hiện tại
+
+Đường speculative đang được hỗ trợ là **embedded MTP resident**.
+
+Memory cần cho weight và runtime của MTP được đưa vào kế hoạch chung với target model.
+
+Các speculative mode khác hiện chưa nằm trong auto streaming path được hỗ trợ.
+
+### 11. Kết hợp được với các tối ưu hữu ích của llama.cpp
+
+VN Mod Stream GPU không thay thế các tối ưu sẵn có của `llama.cpp`.
+
+Trong cấu hình tương thích, người dùng vẫn có thể kết hợp với:
+
+- **Flash Attention**;
+- **K/V cache quantization** như Q4_0 theo hướng cấu hình đã test;
+- các option context/batch phù hợp của `llama.cpp`.
+
+## Cơ chế hoạt động — giải thích cho người dùng
+
+Có thể hình dung đơn giản:
+
+- **RAM = nơi giữ weight**
+- **VRAM = bàn làm việc tốc độ cao**
+- **CUDA GPU = nơi thực hiện tính toán**
+
+Khi khởi động và inference:
+
+1. **Mod kiểm tra model.**  
+   Xác định cấu trúc transformer nào có thể dùng cơ chế streaming an toàn.
+
+2. **Tính lượng VRAM thực sự có thể sử dụng.**  
+   Không chỉ nhìn dung lượng GPU, hệ thống còn tính budget, reserve, context/runtime CUDA memory và các phần liên quan như Vision hoặc embedded MTP.
+
+3. **Weight không cần nằm cố định trong VRAM được giữ ở pinned RAM.**  
+   Nhờ vậy RAM trở thành nguồn weight để GPU lấy khi cần mà không phải đọc lại file GGUF liên tục.
+
+4. **Tạo hai vùng làm việc trong VRAM.**  
+   Các transformer block cần streaming lần lượt được đưa vào hai CUDA slot này.
+
+5. **Chuẩn bị block tiếp theo trước khi cần.**  
+   Prefetch cố gắng chuyển weight tiếp theo trong lúc GPU vẫn đang xử lý công việc hiện tại.
+
+6. **Dùng xong thì tái sử dụng VRAM.**  
+   Slot của block cũ được dùng lại cho block tiếp theo thay vì mỗi block chiếm một vùng VRAM cố định.
+
+7. **Transformer compute tiếp tục chạy trên CUDA.**  
+   Nếu model hoặc runtime không đáp ứng contract mà mod hỗ trợ, quá trình load sẽ dừng thay vì âm thầm chạy theo một đường không được kiểm chứng.
+
+8. **Lần chạy sau có thể nhanh phần chuẩn bị hơn.**  
+   Nếu Profile/Plan Cache còn hợp lệ, mod có thể dùng lại kết quả đã tính trước đó.
+
+Tóm tắt:
+
+**GGUF trên ổ đĩa → weight cần stream được giữ ở pinned RAM → block cần dùng được đưa vào VRAM → CUDA GPU tính toán.**
+
+## Vì sao có thể nhanh hơn CPU-heavy offloading?
+
+Offloading truyền thống thường giải phóng VRAM bằng cách chuyển cả dữ liệu và một phần compute sang CPU.
+
+VN Mod Stream GPU tập trung vào việc chuyển **weight** theo luồng:
 
 **RAM → VRAM → CUDA GPU**
 
-Trong cấu hình đã test, hướng này cho hiệu năng thực tế tốt hơn kiểu CPU-heavy offloading vì weight được stream từ RAM vào VRAM, còn transformer compute tiếp tục chạy trên GPU.
+và giữ transformer compute trên CUDA trong đường được hỗ trợ.
 
-Tốc độ thực tế vẫn phụ thuộc vào model, quantization, context, PCIe, băng thông RAM/CPU, CUDA và GPU.
+Trên cấu hình đã test, cách này cho hiệu năng thực tế tốt hơn đường CPU-heavy offloading dùng để so sánh. Tuy nhiên truyền RAM → VRAM vẫn có chi phí; tốc độ thực tế phụ thuộc PCIe, RAM, CPU/platform, model, quantization, context và GPU.
+
+## Tóm tắt tính năng
+
+| Tính năng | Ý nghĩa với người sử dụng |
+| --- | --- |
+| Auto Weight Streaming | Không cần tự chọn block/layer trong đường auto được hỗ trợ |
+| Model lớn hơn VRAM | Weight có thể nằm ở RAM thay vì tất cả chiếm VRAM |
+| Tối ưu cho context dài | Giảm áp lực weight thường trú để dành ngân sách cho KV/runtime |
+| Persistent pinned RAM | Giữ weight sẵn trong RAM để chuyển lên GPU hiệu quả |
+| 2 CUDA slot tái sử dụng | Một lượng VRAM giới hạn được dùng lần lượt cho nhiều block |
+| Async H2D + Prefetch | Cố gắng chồng lấp truyền weight với GPU compute |
+| CUDA transformer compute | Transformer path được hỗ trợ vẫn chạy trên GPU |
+| Profile + Plan Cache | Tái sử dụng kết quả profile/planning hợp lệ khi khởi động lại |
+| Vision/mmproj accounting | Tính thêm VRAM của Vision trong kế hoạch |
+| Embedded MTP | Tính memory cho đường embedded-MTP hiện được hỗ trợ |
+| Flash Attention | Có thể dùng cùng cấu hình llama.cpp tương thích |
+| Quantized K/V cache | Có thể kết hợp K/V cache quantization tương thích |
+| llama-server | Dùng mod thông qua workflow server/API quen thuộc |
+| Một GPU CUDA | Thiết kế hiện tập trung cho một GPU được chọn |
 
 ## Cấu hình đã test
 
@@ -323,18 +604,19 @@ Bản mod hiện hoạt động tốt trên các model tested đã khai báo ph�
 
 Các GGUF khác có thể hoạt động, nhưng trước khi được test thực tế thì vẫn được xem là **untested**.
 
-## Điểm nổi bật về kiến trúc
+## Trước khi sử dụng
 
-1. Profile model GGUF.
-2. Planner tính ngân sách VRAM, reserve, runtime CUDA allocation và external CUDA usage.
-3. Weight cần streaming được giữ trong persistent pinned RAM.
-4. Hai CUDA slot được tái sử dụng cho các block cần chạy.
-5. Prefetch chuẩn bị block sẽ được dùng tiếp theo.
-6. H2D có thể chạy chồng lấp với GPU evaluation.
-7. Transformer node trong đường hỗ trợ vẫn chạy CUDA.
-8. Profile/Plan cache hỗ trợ khởi động lại nhanh hơn sau khi đã tạo cache hợp lệ.
+VN Mod Stream GPU giúp tận dụng GPU VRAM thấp tốt hơn, nhưng **không biến RAM thành VRAM** và không thể loại bỏ giới hạn vật lý của việc truyền dữ liệu qua PCIe.
 
-Mục tiêu là giúp GPU VRAM hạn chế có thể chạy model lớn và context dài mà không phải phụ thuộc vào CPU transformer offload.
+Để đạt kết quả tốt, người dùng nên chú ý:
+
+- **RAM hệ thống phải đủ lớn** để giữ phần weight được stream cùng hệ điều hành và ứng dụng khác.
+- **RAM và PCIe càng nhanh càng tốt**, vì weight phải đi từ host memory sang GPU.
+- **Reserve VRAM hợp lý**, đặc biệt khi dùng context lớn, Vision hoặc MTP.
+- **Model phải nằm trong layout được hỗ trợ**; model không phù hợp sẽ bị từ chối khi load thay vì cố chạy sai.
+- **Context càng lớn càng tốn memory**, nên không phải cứ tăng context là tốc độ vẫn giữ nguyên.
+
+Mục tiêu của dự án là tự động hóa và tối ưu sự đánh đổi này để GPU phổ thông hữu dụng hơn, không phải khẳng định GPU 12 GB sẽ hoạt động giống một GPU có đủ VRAM để chứa toàn bộ model.
 
 ## Cài đặt
 
