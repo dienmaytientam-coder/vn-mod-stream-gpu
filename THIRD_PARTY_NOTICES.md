@@ -12,7 +12,7 @@ This repository contains source additions and an integration patch intended to b
 
 The file `mod/integration.patch` contains modifications to existing llama.cpp files and therefore also contains patch context originating from those upstream files. That upstream material remains subject to the llama.cpp MIT License and copyright notice retained in this repository's [`LICENSE`](LICENSE).
 
-The VN GPU weight streaming additions in `mod/src`, the related tests in `mod/tests`, and project-specific modifications are distributed under the MIT License with:
+The VN Mod Stream GPU additions in `mod/src`, the related tests in `mod/tests`, and project-specific modifications are distributed under the MIT License with:
 
 Copyright (c) 2026 dienmaytientam-coder
 

@@ -1,4 +1,4 @@
-# Mod source and integration
+# VN Mod Stream GPU — source and integration
 
 These are the mod's new source and test files. `integration.patch` contains only the changes to existing llama.cpp files, such as CLI, model loading, CUDA graph scheduling, CMake, and server integration. It does not contain the new files in this directory.
 

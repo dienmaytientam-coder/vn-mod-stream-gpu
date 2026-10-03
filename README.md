@@ -1,4 +1,4 @@
-# VN GPU weight streaming mod
+# VN Mod Stream GPU
 
 This repository shares only the mod source, tests, and the integration patch for llama.cpp. It does not contain the llama.cpp source tree, build output, binaries, or model files.
 
@@ -20,7 +20,7 @@ The upstream project remains under its MIT license. This repository includes the
 
 This repository is distributed under the MIT License.
 
-The files created for the VN GPU weight streaming mod under `mod/src` and `mod/tests` carry SPDX MIT identifiers and the project copyright notice.
+The files created for the VN Mod Stream GPU under `mod/src` and `mod/tests` carry SPDX MIT identifiers and the project copyright notice.
 
 `mod/integration.patch` modifies existing files from `ggml-org/llama.cpp` and contains patch context from upstream revision `73c941b11165cc0f7a36ba17380e79e8fe9797dc`. Upstream material remains copyright of the ggml authors and is used under the upstream MIT License.
 
